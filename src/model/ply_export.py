@@ -7,7 +7,7 @@ from jaxtyping import Float
 from plyfile import PlyData, PlyElement
 from scipy.spatial.transform import Rotation as R
 from torch import Tensor
-
+import os
 
 def construct_list_of_attributes(num_rest: int) -> list[str]:
     attributes = ["x", "y", "z", "nx", "ny", "nz"]
@@ -137,3 +137,14 @@ def export_ply(
     elements[:] = list(map(tuple, attributes))
     path.parent.mkdir(exist_ok=True, parents=True)
     PlyData([PlyElement.describe(elements, "vertex")]).write(path)
+
+def write_ply(xyz, rgb, path='./test.ply'):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {xyz.shape[0]}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+        for p, c in zip(xyz, rgb):
+            f.write(f"{p[0]:.3f} {p[1]:.3f} {p[2]:.3f} "
+                    f"{int(c[0]*255)} {int(c[1]*255)} {int(c[2]*255)}\n")

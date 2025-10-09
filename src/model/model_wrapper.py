@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable, Any
 
-import moviepy.editor as mpy
+from moviepy import *
 import torch
 import wandb
 from einops import pack, rearrange, repeat
@@ -12,6 +12,7 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
 from tabulate import tabulate
 from torch import Tensor, nn, optim
+from torchvision.transforms.functional import to_pil_image
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -40,9 +41,15 @@ from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode
+from .decoder.cuda_splatting import render_cuda_orthographic, render_bevs, forward_project, project_point_clouds
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 
+from .ply_export import export_ply, write_ply
+from .vis import vis_bev
+
+import torchvision.transforms as transforms
+to_pil_image = transforms.ToPILImage()
 
 @dataclass
 class OptimizerCfg:
@@ -148,7 +155,7 @@ class ModelWrapper(LightningModule):
                             raise NotImplementedError
             batch = batch_combined
         batch: BatchedExample = self.data_shim(batch)
-        _, _, _, h, w = batch["target"]["image"].shape
+        b, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
         visualization_dump = None
@@ -165,6 +172,8 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
         target_gt = batch["target"]["image"]
+
+        vis_bev(batch, gaussians, output)
 
         # Compute metrics.
         psnr_probabilistic = compute_psnr(
@@ -239,6 +248,8 @@ class ModelWrapper(LightningModule):
                     batch["target"]["far"],
                     (h, w),
                 )
+
+        vis_bev(batch, gaussians, output)
 
         # compute scores
         if self.test_cfg.compute_scores:
@@ -341,7 +352,7 @@ class ModelWrapper(LightningModule):
                         cam_trans_delta.data.fill_(0)
 
                         extrinsics = rearrange(new_extrinsic, "(b v) i j -> b v i j", b=b, v=v)
-
+                    print('total_loss', total_loss)
         # Render Gaussians.
         output = self.decoder.forward(
             gaussians,
@@ -456,23 +467,23 @@ class ModelWrapper(LightningModule):
             step=self.global_step,
         )
 
-        # Draw cameras.
-        cameras = hcat(*render_cameras(batch, 256))
-        self.logger.log_image(
-            "cameras", [prep_image(add_border(cameras))], step=self.global_step
-        )
+        # # Draw cameras.
+        # cameras = hcat(*render_cameras(batch, 256))
+        # self.logger.log_image(
+        #     "cameras", [prep_image(add_border(cameras))], step=self.global_step
+        # )
 
-        if self.encoder_visualizer is not None:
-            for k, image in self.encoder_visualizer.visualize(
-                batch["context"], self.global_step
-            ).items():
-                self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+        # if self.encoder_visualizer is not None:
+        #     for k, image in self.encoder_visualizer.visualize(
+        #         batch["context"], self.global_step
+        #     ).items():
+        #         self.logger.log_image(k, [prep_image(image)], step=self.global_step)
 
-        # Run video validation step.
-        self.render_video_interpolation(batch)
-        self.render_video_wobble(batch)
-        if self.train_cfg.extended_visualization:
-            self.render_video_interpolation_exaggerated(batch)
+        # # Run video validation step.
+        # self.render_video_interpolation(batch)
+        # self.render_video_wobble(batch)
+        # if self.train_cfg.extended_visualization:
+        #     self.render_video_interpolation_exaggerated(batch)
 
     @rank_zero_only
     def render_video_wobble(self, batch: BatchedExample) -> None:

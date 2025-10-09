@@ -151,3 +151,59 @@ class UnifiedGaussianAdapter(GaussianAdapter):
             scales=scales,
             rotations=rotations.broadcast_to((*scales.shape[:-1], 4)),
         )
+
+# 修改后的 Debug Adapter
+class DebugGaussianAdapter(GaussianAdapter):
+    def forward(
+        self,
+        means: Float[Tensor, "*#batch 3"],
+        # 新增 rgbs 输入，用于直接设置颜色
+        rgbs: Float[Tensor, "*#batch 3"],
+        # 以下参数虽然传入，但在函数内部会被忽略或覆盖
+        depths: Optional[Float[Tensor, "*#batch"]] = None,
+        opacities: Optional[Float[Tensor, "*#batch"]] = None,
+        raw_gaussians: Optional[Float[Tensor, "*#batch _"]] = None,
+        eps: float = 1e-8,
+        intrinsics: Optional[Float[Tensor, "*#batch 3 3"]] = None,
+        coordinates: Optional[Float[Tensor, "*#batch 2"]] = None,
+        # 可以添加一个参数来控制调试时球体的大小
+        debug_scale: float = 0.002,
+    ) -> Gaussians:
+        
+        batch_shape = means.shape[:-1]
+        device = means.device
+        dtype = means.dtype
+
+        # 1. 固定 Scales 为一个较小的值
+        # 创建一个形状匹配的张量，并用 debug_scale 填充
+        scales = torch.full((*batch_shape, 3), fill_value=debug_scale, device=device, dtype=dtype)
+
+        # 2. 固定 Rotations 为单位四元数 (无旋转)
+        # 单位四元数 (w, x, y, z) = (1, 0, 0, 0)
+        rotations = torch.zeros((*batch_shape, 4), device=device, dtype=dtype)
+        rotations[..., 0] = 1.0  # 设置 w 分量为 1
+
+        # 3. 根据输入的 RGB 值构建球谐函数 (SH)
+        # 3DGS 中，0阶SH系数 (DC term) 需要进行标准化
+        C0 = 0.28209479177387814
+        sh_dc = (rgbs - 0.5) / C0
+        # 创建一个全零的SH张量
+        sh = torch.zeros((*batch_shape, 3, self.d_sh), device=device, dtype=dtype)
+        # 将标准化的RGB颜色赋给0阶系数 (DC term)
+        # sh的形状是 [..., 3, d_sh]，我们只填充第一个系数
+        sh[..., 0] = sh_dc
+
+        # 4. 固定 Opacities 为 1 (完全不透明)
+        opacities_debug = torch.ones(*batch_shape, device=device, dtype=dtype)
+
+        # 5. 根据固定的 scales 和 rotations 构建协方差矩阵
+        covariances = build_covariance(scales, rotations)
+
+        return Gaussians(
+            means=means,
+            covariances=covariances,
+            harmonics=sh,
+            opacities=opacities_debug,
+            scales=scales,
+            rotations=rotations,
+        )

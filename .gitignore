@@ -175,3 +175,8 @@ cython_debug/
 table.tex
 /baselines
 /test/*
+
+/pretrained_weights/*
+/test_img/*
+*.ply
+*.png

@@ -17,13 +17,13 @@ from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
-from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
+from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter, DebugGaussianAdapter
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 
 
 inf = float('inf')
-
+debug = False
 
 @dataclass
 class OpacityMappingCfg:
@@ -69,7 +69,9 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.backbone = get_backbone(cfg.backbone, 3)
 
         self.pose_free = cfg.pose_free
-        if self.pose_free:
+        if debug:
+            self.gaussian_adapter = DebugGaussianAdapter(cfg.gaussian_adapter)
+        elif self.pose_free:
             self.gaussian_adapter = UnifiedGaussianAdapter(cfg.gaussian_adapter)
         else:
             self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
@@ -173,6 +175,15 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         pts_all = torch.stack((pts3d1, pts3d2), dim=1)
         pts_all = pts_all.unsqueeze(-2)  # for cfg.num_surfaces
 
+        rgb1 = view1['img']
+        rgb1 = rearrange(rgb1, "b c h w -> b (h w) c")
+        rgb2 = view2['img']
+        rgb2 = rearrange(rgb2, "b c h w -> b (h w) c")
+        rgb_all = torch.stack((rgb1, rgb2), dim=1)
+        rgb_all = (rgb_all.unsqueeze(-2) + 1.0) / 2.0
+        mask = rgb_all.any(dim=-1).float().unsqueeze(-1)
+        pts_all = pts_all * mask
+
         depths = pts_all[..., -1].unsqueeze(-1)
 
         gaussians = torch.stack([GS_res1, GS_res2], dim=1)
@@ -180,7 +191,12 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         densities = gaussians[..., 0].sigmoid().unsqueeze(-1)
 
         # Convert the features and depths into Gaussians.
-        if self.pose_free:
+        if debug:
+            gaussians = self.gaussian_adapter.forward(
+                pts_all.unsqueeze(-2),
+                rgb_all.unsqueeze(-2),
+            )
+        elif self.pose_free:
             gaussians = self.gaussian_adapter.forward(
                 pts_all.unsqueeze(-2),
                 depths,

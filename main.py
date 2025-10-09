@@ -41,7 +41,7 @@ def cyan(text: str) -> str:
 
 @hydra.main(
     version_base=None,
-    config_path="../config",
+    config_path="./config",
     config_name="main",
 )
 def train(cfg_dict: DictConfig):

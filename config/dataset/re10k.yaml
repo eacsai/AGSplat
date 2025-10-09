@@ -4,7 +4,7 @@ defaults:
   - optional view_sampler_dataset_specific_config@view_sampler: bounded_re10k
 
 name: re10k
-roots: [datasets/re10k]
+roots: [/home/qiwei/program/NoPoSplat/datasets/re10k_subset]
 
 input_image_shape: [256, 256]
 original_image_shape: [360, 640]

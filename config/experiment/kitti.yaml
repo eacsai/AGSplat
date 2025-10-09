@@ -1,14 +1,14 @@
 # @package _global_
 
 defaults:
-  - /dataset@_group_.re10k: re10k
+  - /dataset@_group_.kitti: kitti
   - override /model/encoder: noposplat
   - override /model/encoder/backbone: croco
   - override /loss: [mse, lpips]
 
 wandb:
-  name: re10k
-  tags: [re10k, 256x256]
+  name: kitti
+  tags: [kitti, 256x256]
 
 model:
   encoder:
@@ -21,7 +21,7 @@ model:
     make_scale_invariant: true
 
 dataset:
-  re10k:
+  kitti:
     view_sampler:
       warm_up_steps: 9375
 

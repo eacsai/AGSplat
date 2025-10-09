@@ -59,38 +59,38 @@ def draw_cameras(
         )
 
         # Draw near and far planes.
-        if near is not None:
-            projected_near_corners = project(near_corners)
-            image = draw_lines(
-                image,
-                rearrange(projected_near_corners, "b p xy -> (b p) xy"),
-                rearrange(projected_near_corners.roll(1, 1), "b p xy -> (b p) xy"),
-                color=0.25,
-                width=2,
-                x_range=x_range,
-                y_range=y_range,
-            )
-        if far is not None:
-            projected_far_corners = project(far_corners)
-            image = draw_lines(
-                image,
-                rearrange(projected_far_corners, "b p xy -> (b p) xy"),
-                rearrange(projected_far_corners.roll(1, 1), "b p xy -> (b p) xy"),
-                color=0.25,
-                width=2,
-                x_range=x_range,
-                y_range=y_range,
-            )
-        if near is not None and far is not None:
-            image = draw_lines(
-                image,
-                rearrange(projected_near_corners, "b p xy -> (b p) xy"),
-                rearrange(projected_far_corners, "b p xy -> (b p) xy"),
-                color=0.25,
-                width=2,
-                x_range=x_range,
-                y_range=y_range,
-            )
+        # if near is not None:
+        #     projected_near_corners = project(near_corners)
+        #     image = draw_lines(
+        #         image,
+        #         rearrange(projected_near_corners, "b p xy -> (b p) xy"),
+        #         rearrange(projected_near_corners.roll(1, 1), "b p xy -> (b p) xy"),
+        #         color=0.25,
+        #         width=2,
+        #         x_range=x_range,
+        #         y_range=y_range,
+        #     )
+        # if far is not None:
+        #     projected_far_corners = project(far_corners)
+        #     image = draw_lines(
+        #         image,
+        #         rearrange(projected_far_corners, "b p xy -> (b p) xy"),
+        #         rearrange(projected_far_corners.roll(1, 1), "b p xy -> (b p) xy"),
+        #         color=0.25,
+        #         width=2,
+        #         x_range=x_range,
+        #         y_range=y_range,
+        #     )
+        # if near is not None and far is not None:
+        #     image = draw_lines(
+        #         image,
+        #         rearrange(projected_near_corners, "b p xy -> (b p) xy"),
+        #         rearrange(projected_far_corners, "b p xy -> (b p) xy"),
+        #         color=0.25,
+        #         width=2,
+        #         x_range=x_range,
+        #         y_range=y_range,
+        #     )
 
         # Draw the camera frustums themselves.
         projected_origins = project(extrinsics[:, :3, 3])
