@@ -84,6 +84,7 @@ class TestCfg:
 @dataclass
 class TrainCfg:
     depth_mode: DepthRenderingMode | None
+    output_path: Path
     extended_visualization: bool
     print_log_every_n_steps: int
     distiller: str
@@ -282,11 +283,15 @@ class ModelWrapper(LightningModule):
             self.global_rank == 0
             and self.global_step % self.train_cfg.print_log_every_n_steps == 0
         ):
+            # 获取当前学习率
+            current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
+
             print(
                 f"train step {self.global_step}; "
                 f"scene = {[x[:20] for x in batch['scene']]}; "
                 f"context = {batch['context']['index'].tolist()}; "
-                f"loss = {total_loss:.6f}"
+                f"loss = {total_loss:.6f}; "
+                f"lr = {current_lr:.2e}"
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
@@ -334,20 +339,6 @@ class ModelWrapper(LightningModule):
 
         gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
         gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
-
-        # align the target pose
-        if self.test_cfg.align_pose:
-            output = self.test_step_align(batch, gaussians)
-        else:
-            with self.benchmarker.time("decoder", num_calls=v):
-                output = self.decoder.forward(
-                    gaussians,
-                    batch["target"]["extrinsics"],
-                    batch["target"]["intrinsics"],
-                    batch["target"]["near"],
-                    batch["target"]["far"],
-                    (h, w),
-                )
 
         # get gaussian bev
         heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
@@ -407,78 +398,6 @@ class ModelWrapper(LightningModule):
             gt_shift_u[0].cpu().detach().numpy(),
             gt_shift_v[0].cpu().detach().numpy()
         )
-
-    def test_step_align(self, batch, gaussians):
-        self.encoder.eval()
-        # freeze all parameters
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
-        b, v, _, h, w = batch["target"]["image"].shape
-        with torch.set_grad_enabled(True):
-            cam_rot_delta = nn.Parameter(torch.zeros([b, v, 3], requires_grad=True, device=self.device))
-            cam_trans_delta = nn.Parameter(torch.zeros([b, v, 3], requires_grad=True, device=self.device))
-
-            opt_params = []
-            opt_params.append(
-                {
-                    "params": [cam_rot_delta],
-                    "lr": self.test_cfg.rot_opt_lr,
-                }
-            )
-            opt_params.append(
-                {
-                    "params": [cam_trans_delta],
-                    "lr": self.test_cfg.trans_opt_lr,
-                }
-            )
-            pose_optimizer = torch.optim.Adam(opt_params)
-
-            extrinsics = batch["target"]["extrinsics"].clone()
-            with self.benchmarker.time("optimize"):
-                for i in range(self.test_cfg.pose_align_steps):
-                    pose_optimizer.zero_grad()
-
-                    output = self.decoder.forward(
-                        gaussians,
-                        extrinsics,
-                        batch["target"]["intrinsics"],
-                        batch["target"]["near"],
-                        batch["target"]["far"],
-                        (h, w),
-                        cam_rot_delta=cam_rot_delta,
-                        cam_trans_delta=cam_trans_delta,
-                    )
-
-                    # Compute and log loss.
-                    total_loss = 0
-                    for loss_fn in self.losses:
-                        loss = loss_fn.forward(output, batch, gaussians, self.global_step)
-                        total_loss = total_loss + loss
-
-                    total_loss.backward()
-                    with torch.no_grad():
-                        pose_optimizer.step()
-                        new_extrinsic = update_pose(cam_rot_delta=rearrange(cam_rot_delta, "b v i -> (b v) i"),
-                                                    cam_trans_delta=rearrange(cam_trans_delta, "b v i -> (b v) i"),
-                                                    extrinsics=rearrange(extrinsics, "b v i j -> (b v) i j")
-                                                    )
-                        cam_rot_delta.data.fill_(0)
-                        cam_trans_delta.data.fill_(0)
-
-                        extrinsics = rearrange(new_extrinsic, "(b v) i j -> b v i j", b=b, v=v)
-                    print('total_loss', total_loss)
-        # Render Gaussians.
-        output = self.decoder.forward(
-            gaussians,
-            extrinsics,
-            batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
-            (h, w),
-        )
-
-        return output
 
     def visualize_positions_on_satellite(self, gaussians, batch, pred_u, pred_v, gt_shift_u, gt_shift_v):
         """
@@ -622,7 +541,7 @@ class ModelWrapper(LightningModule):
                         center_x + radius, center_y + radius),
                         fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
             # 保存图片
-            test_img.save('direct_bev.png')
+            test_img.save(os.path.join(save_dir, 'direct_bev.png'))
 
         except Exception as e:
             print(f"Error in position visualization: {e}")
@@ -664,8 +583,8 @@ class ModelWrapper(LightningModule):
                     'pred_lons': pred_lons
                 })
 
-                # Write results to text file
-                with open(save_path / 'test_results.txt', 'w') as f:
+                # Write results to text file (append mode)
+                with open(save_path / 'test_results.txt', 'a') as f:
                     f.write('====================================\n')
                     f.write(f'       TEST RESULTS\n')
                     f.write('====================================\n')
@@ -760,15 +679,10 @@ class ModelWrapper(LightningModule):
         current_epoch = self.current_epoch
 
         # 获取输出目录
-        try:
-            name = get_cfg()["wandb"]["name"]
-            # 使用验证特有的目录
-            save_path = self.test_cfg.output_path / f"{name}_val_epoch_{current_epoch + 1}"
-            save_path.mkdir(parents=True, exist_ok=True)
-        except:
-            # 如果获取配置失败，使用默认路径
-            save_path = Path("outputs") / f"val_epoch_{current_epoch + 1}"
-            save_path.mkdir(parents=True, exist_ok=True)
+        name = get_cfg()["wandb"]["name"]
+        # 使用验证特有的目录
+        save_path = self.train_cfg.output_path / f"exp_{name}"
+        save_path.mkdir(parents=True, exist_ok=True)
 
         # Calculate and print evaluation metrics if we have predictions
         if self.pred_lons and self.pred_lats and self.gt_lons and self.gt_lats:
@@ -796,7 +710,7 @@ class ModelWrapper(LightningModule):
                 })
 
                 # Write results to text file
-                with open(save_path / 'val_results.txt', 'w') as f:
+                with open(save_path / f"{name}_val_epoch_{current_epoch + 1}_results.txt", 'w') as f:
                     f.write('====================================\n')
                     f.write(f'  VALIDATION EPOCH {current_epoch + 1} RESULTS\n')
                     f.write('====================================\n')
@@ -956,8 +870,8 @@ class ModelWrapper(LightningModule):
         pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lon
         pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lat
 
-        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0
-        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0
+        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位(m)
+        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位(m)
         # Store pred_u and pred_v values in the lists
         self.pred_lons.extend(pred_u.cpu().detach().numpy())
         self.pred_lats.extend(pred_v.cpu().detach().numpy())
@@ -974,9 +888,13 @@ class ModelWrapper(LightningModule):
     def configure_optimizers(self):
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
+        params, param_names = [], []
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
+            
+            params.append(param)
+            param_names.append(name)
 
             if "gaussian_param_head" in name or "intrinsic_encoder" in name:
                 new_params.append(param)
@@ -985,16 +903,24 @@ class ModelWrapper(LightningModule):
                 pretrained_params.append(param)
                 pretrained_param_names.append(name)
 
+        # param_dicts = [
+        #     {
+        #         "params": new_params,
+        #         "lr": self.optimizer_cfg.lr,
+        #      },
+        #     {
+        #         "params": pretrained_params,
+        #         "lr": self.optimizer_cfg.lr,
+        #     },
+        # ]
+
         param_dicts = [
             {
-                "params": new_params,
+                "params": params,
                 "lr": self.optimizer_cfg.lr,
-             },
-            {
-                "params": pretrained_params,
-                "lr": self.optimizer_cfg.lr * self.optimizer_cfg.backbone_lr_multiplier,
             },
         ]
+
         optimizer = torch.optim.AdamW(param_dicts, lr=self.optimizer_cfg.lr, weight_decay=0.05, betas=(0.9, 0.95))
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         warm_up = torch.optim.lr_scheduler.LinearLR(
@@ -1004,7 +930,8 @@ class ModelWrapper(LightningModule):
             total_iters=warm_up_steps,
         )
 
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=get_cfg()["trainer"]["max_steps"], eta_min=self.optimizer_cfg.lr * 0.1)
+        max_steps = get_cfg()["trainer"]["max_steps"] * get_cfg()["trainer"]["max_epochs"] / get_cfg()["data_loader"]["train"]["batch_size"]
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=self.optimizer_cfg.lr * 0.1)
         lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warm_up, lr_scheduler], milestones=[warm_up_steps])
 
         return {

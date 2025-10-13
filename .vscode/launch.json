@@ -55,7 +55,7 @@
                 "+experiment=kitti",
                 "mode=test",
                 "wandb.mode=disabled",
-                "checkpointing.load=./checkpoints/initial_weights.ckpt",
+                "checkpointing.load=./checkpoints/epoch_00-test.ckpt",
                 "wandb.name=kitti",
             ],
             "console": "integratedTerminal",

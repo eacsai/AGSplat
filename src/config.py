@@ -33,6 +33,10 @@ class TrainerCfg:
     val_check_interval: int | float | None
     gradient_clip_val: int | float | None
     num_nodes: int = 1
+    check_val_every_n_epoch: int = 1
+    max_epochs: int = -1
+    enable_progress_bar: bool = True
+    num_sanity_val_steps: int = 0
 
 
 @dataclass

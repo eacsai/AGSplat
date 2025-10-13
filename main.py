@@ -1,6 +1,6 @@
 import os
 import warnings
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # 设置 DDP 相关环境变量来优化性能
 os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息
@@ -60,9 +60,8 @@ def train(cfg_dict: DictConfig):
     set_cfg(cfg_dict)
 
     # Set up the output directory.
-    output_dir = Path(
-        hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]
-    )
+    output_dir = cfg.train.output_path / f"exp_{cfg.wandb['name']}"
+    output_dir = Path(output_dir)
     print(cyan(f"Saving outputs to {output_dir}."))
 
     # Set up logging with wandb.
@@ -88,7 +87,7 @@ def train(cfg_dict: DictConfig):
     # 添加专门的测试权重保存Callback - 每个epoch保存
     callbacks.append(
         ModelCheckpoint(
-            output_dir / "checkpoints" / "test_weights",
+            output_dir / "checkpoints",
             every_n_epochs=1,  # 每个epoch保存一次
             save_last=True,  # 保存最后一个epoch的权重
             save_top_k=-1,  # 保存所有epoch的权重
@@ -131,7 +130,7 @@ def train(cfg_dict: DictConfig):
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         # plugins=[SLURMEnvironment(requeue_signal=signal.SIGUSR1)],  # Uncomment for SLURM auto resubmission.
         inference_mode=False if (cfg.mode == "test" and cfg.test.align_pose) else True,
-        num_sanity_val_steps=10,
+        num_sanity_val_steps=getattr(cfg.trainer, 'num_sanity_val_steps', 2),
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 

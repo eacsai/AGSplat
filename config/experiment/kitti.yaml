@@ -27,16 +27,17 @@ dataset:
 
 optimizer:
   lr: 6.25e-5
-  warm_up_steps: 125
+  warm_up_steps: 500
   backbone_lr_multiplier: 0.1
 
 data_loader:
   train:
-    batch_size: 4
+    batch_size: 2
 
 trainer:
   max_epochs: 10
   val_check_interval: 1.0
+  max_steps: 20000 # 确保训练不会因为步数限制而过早停止
 
 checkpointing:
   every_n_train_steps: 9375
