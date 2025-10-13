@@ -112,7 +112,7 @@ class DataModule(LightningDataModule):
             dataset = self.dataset_shim(dataset, "val")
             data_loaders.append(
                 DataLoader(
-                    ValidationWrapper(dataset, 1),
+                    dataset,
                     self.data_loader_cfg.val.batch_size,
                     num_workers=self.data_loader_cfg.val.num_workers,
                     generator=self.get_generator(self.data_loader_cfg.val),

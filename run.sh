@@ -1,0 +1,1 @@
+HYDRA_FULL_ERROR=1 python main.py +experiment=kitti wandb.mode=disabled wandb.name=kitti

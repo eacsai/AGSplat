@@ -10,3 +10,5 @@ class Gaussians:
     covariances: Float[Tensor, "batch gaussian dim dim"]
     harmonics: Float[Tensor, "batch gaussian 3 d_sh"]
     opacities: Float[Tensor, "batch gaussian"]
+    features: Float[Tensor, "batch gaussian d_feat"] | None = None
+    confidences: Float[Tensor, "batch gaussian"] | None = None

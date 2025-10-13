@@ -42,12 +42,9 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         near: Float[Tensor, "batch view"],
         far: Float[Tensor, "batch view"],
         image_shape: tuple[int, int],
-        depth_mode: DepthRenderingMode | None = None,
-        cam_rot_delta: Float[Tensor, "batch view 3"] | None = None,
-        cam_trans_delta: Float[Tensor, "batch view 3"] | None = None,
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
-        color, depth = render_cuda(
+        color, feature, confidence, _, depth = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
             rearrange(intrinsics, "b v i j -> (b v) i j"),
             rearrange(near, "b v -> (b v)"),
@@ -58,11 +55,12 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
             repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            repeat(gaussians.features, "b g c -> (b v) g c", v=v) if gaussians.features is not None else None,
+            repeat(gaussians.confidences, "b g 1 -> (b v) g 1", v=v) if gaussians.confidences is not None else None,
             scale_invariant=self.make_scale_invariant,
-            cam_rot_delta=rearrange(cam_rot_delta, "b v i -> (b v) i") if cam_rot_delta is not None else None,
-            cam_trans_delta=rearrange(cam_trans_delta, "b v i -> (b v) i") if cam_trans_delta is not None else None,
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
-
+        feature = rearrange(feature, "(b v) c h w -> b v c h w", b=b, v=v) if feature is not None else None
+        confidence = rearrange(confidence, "(b v) 1 h w -> b v 1 h w", b=b, v=v) if confidence is not None else None
         depth = rearrange(depth, "(b v) h w -> b v h w", b=b, v=v)
-        return DecoderOutput(color, depth)
+        return DecoderOutput(color, feature, confidence, depth)

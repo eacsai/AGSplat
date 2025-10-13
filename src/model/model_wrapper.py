@@ -13,6 +13,9 @@ from lightning.pytorch.utilities import rank_zero_only
 from tabulate import tabulate
 from torch import Tensor, nn, optim
 from torchvision.transforms.functional import to_pil_image
+from torchvision.transforms import functional as TF
+import torch.nn.functional as F
+import numpy as np
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -46,9 +49,16 @@ from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 
 from .ply_export import export_ply, write_ply
-from .vis import vis_bev
+from .vis import vis_bev, single_features_to_RGB_colormap
+from .dino_dpt import DINO, DPT
+from ..dataset.dataset_kitti import get_meter_per_pixel
+import os
+import scipy.io as scio
+from PIL import Image, ImageDraw
 
 import torchvision.transforms as transforms
+import cv2
+import os
 to_pil_image = transforms.ToPILImage()
 
 @dataclass
@@ -127,7 +137,10 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.dino_feat = DINO()
+        self.dpt = DPT(self.dino_feat.feat_dim)
 
+        self.meters_per_pixel = get_meter_per_pixel() * 4  # downsampled by 4
         self.distiller = distiller
         self.distiller_loss = None
         if self.distiller is not None:
@@ -136,6 +149,12 @@ class ModelWrapper(LightningModule):
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
+
+        # Initialize lists to store pred_u and pred_v during testing
+        self.pred_lons = []
+        self.pred_lats = []
+        self.gt_lons = []
+        self.gt_lats = []
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -155,50 +174,107 @@ class ModelWrapper(LightningModule):
                             raise NotImplementedError
             batch = batch_combined
         batch: BatchedExample = self.data_shim(batch)
-        b, _, _, h, w = batch["target"]["image"].shape
+        # Render Gaussians.
+        feat_img = batch["context"]["feat_image"]
+        grd_img = batch["context"]["image"]
+        b, v, _, h, w = grd_img.shape
+        feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
+        sat_img = batch["sat"]["sat"]
 
+        # extract grd and sat feature
+        with torch.no_grad():
+            # dino
+            sat_feat = self.dino_feat(sat_img)
+            grd_feat = self.dino_feat(feat_img)
+            if isinstance(sat_feat, (tuple, list)):
+                sat_feats = [_f.detach() for _f in sat_feat]
+            if isinstance(grd_feat, (tuple, list)):
+                grd_feats = [_f.detach() for _f in grd_feat]
+        
+        # TODO: use two dpt and upsample grd_feat
+        # dpt
+        sat_feat, sat_conf = self.dpt(sat_feats)
+        grd_feat, grd_conf = self.dpt(grd_feats)
+        A = sat_feat.shape[-1]
         # Run the model.
         visualization_dump = None
         if self.distiller is not None:
             visualization_dump = {}
+        
         gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
-        output = self.decoder.forward(
-            gaussians,
-            batch["target"]["extrinsics"],
-            batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
-            (h, w),
-            depth_mode=self.train_cfg.depth_mode,
+        
+        gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
+        gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
+        
+        # get gaussian bev
+        heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
+        grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
+            gaussians, 
+            (A, A),
+            heading=heading, 
+            width=100.0, 
+            height=100.0
         )
-        target_gt = batch["target"]["image"]
+        meter_per_pixel = self.meters_per_pixel
 
-        vis_bev(batch, gaussians, output)
+        crop_H = int(A - 20 * 3 / meter_per_pixel)
+        crop_W = int(A - 20 * 3 / meter_per_pixel)
+        g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
 
-        # Compute metrics.
-        psnr_probabilistic = compute_psnr(
-            rearrange(target_gt, "b v c h w -> (b v) c h w"),
-            rearrange(output.color, "b v c h w -> (b v) c h w"),
+        rgb_bev = grd2sat_color[0]
+        test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+        test_img.save('splat_bev.png')
+
+        # vis_bev(batch, gaussians, output)
+        # single_features_to_RGB_colormap(grd2sat_feature, idx=0, img_name='bev_feature.png', cmap_name='rainbow')
+        signal = sat_feat.repeat(1, b, 1, 1)  # [B(M), BC(NC), H, W]
+        kernel = g2s_feat * g2s_conf.pow(2)
+        corr = F.conv2d(signal, kernel, groups=b)
+
+        denominator_sat = []
+        sat_feat_pow = (sat_feat).pow(2)
+        g2s_conf_pow = g2s_conf.pow(2)
+        for i in range(0, b):
+            denom_sat = torch.sum(F.conv2d(sat_feat_pow[i, :, None, :, :], g2s_conf_pow), dim=0)
+            denominator_sat.append(denom_sat)
+        denominator_sat = torch.sqrt(torch.stack(denominator_sat, dim=0))  # [B (M), B (N), H, W]
+
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1) # [B]
+        shape = denominator_sat.shape
+        denominator_grd = denom_grd[None, :, None, None].repeat(shape[0], 1, shape[2], shape[3])
+
+        denominator = denominator_sat * denominator_grd
+        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
+        corr = 2 - 2 * corr / denominator  # [B, B, H, W]
+
+        corr_H, corr_W = corr.shape[2:]
+        max_index = torch.argmin(corr[0, 0].reshape(-1)).data.cpu().numpy()
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel
+
+        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位：（m）
+        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位：（m）
+
+        self.visualize_positions_on_satellite(
+            gaussians, batch, pred_u, pred_v,
+            gt_shift_u[0].cpu().detach().numpy(),
+            gt_shift_v[0].cpu().detach().numpy()
         )
-        self.log("train/psnr_probabilistic", psnr_probabilistic.mean())
 
         # Compute and log loss.
         total_loss = 0
         for loss_fn in self.losses:
-            loss = loss_fn.forward(output, batch, gaussians, self.global_step)
+            loss = loss_fn.forward(
+                batch,
+                corr,
+                g2s_feat, 
+                g2s_conf, 
+                sat_feat,
+                meter_per_pixel,
+            )
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
-
-        # distillation
-        if self.distiller is not None and self.global_step <= self.train_cfg.distill_max_steps:
-            with torch.no_grad():
-                pseudo_gt1, pseudo_gt2 = self.distiller(batch["context"], False)
-            distillation_loss = self.distiller_loss(pseudo_gt1['pts3d'], pseudo_gt2['pts3d'],
-                                                    visualization_dump['means'][:, 0].squeeze(-2),
-                                                    visualization_dump['means'][:, 1].squeeze(-2),
-                                                    pseudo_gt1['conf'], pseudo_gt2['conf'], disable_view1=False) * 0.1
-            self.log("loss/distillation_loss", distillation_loss)
-            total_loss = total_loss + distillation_loss
 
         self.log("loss/total", total_loss)
 
@@ -224,9 +300,30 @@ class ModelWrapper(LightningModule):
         batch: BatchedExample = self.data_shim(batch)
 
         b, v, _, h, w = batch["target"]["image"].shape
-        assert b == 1
+
+        feat_img = batch["context"]["feat_image"]
+        grd_img = batch["context"]["image"]
+        b, v, _, h, w = grd_img.shape
+        feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
+        sat_img = batch["sat"]["sat"]
+
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
+
+        # extract grd and sat feature
+        with torch.no_grad():
+            # dino
+            sat_feat = self.dino_feat(sat_img)
+            grd_feat = self.dino_feat(feat_img)
+            if isinstance(sat_feat, (tuple, list)):
+                sat_feats = [_f.detach() for _f in sat_feat]
+            if isinstance(grd_feat, (tuple, list)):
+                grd_feats = [_f.detach() for _f in grd_feat]
+
+        # dpt
+        sat_feat, sat_conf = self.dpt(sat_feats)
+        grd_feat, grd_conf = self.dpt(grd_feats)
+        A = sat_feat.shape[-1]
 
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
@@ -234,6 +331,9 @@ class ModelWrapper(LightningModule):
                 batch["context"],
                 self.global_step,
             )
+
+        gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
+        gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
 
         # align the target pose
         if self.test_cfg.align_pose:
@@ -249,49 +349,64 @@ class ModelWrapper(LightningModule):
                     (h, w),
                 )
 
-        vis_bev(batch, gaussians, output)
+        # get gaussian bev
+        heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
+        grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
+            gaussians, 
+            (A, A),
+            heading=heading, 
+            width=100.0, 
+            height=100.0
+        )
+        crop_H = int(A - 20 * 3 / self.meters_per_pixel)
+        crop_W = int(A - 20 * 3 / self.meters_per_pixel)
+        g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
 
-        # compute scores
-        if self.test_cfg.compute_scores:
-            overlap = batch["context"]["overlap"][0]
-            overlap_tag = get_overlap_tag(overlap)
+        rgb_bev = grd2sat_color[0]
+        test_img = to_pil_image(rgb_bev)
+        test_img.save('splat_bev.png')
 
-            rgb_pred = output.color[0]
-            rgb_gt = batch["target"]["image"][0]
-            all_metrics = {
-                f"lpips_ours": compute_lpips(rgb_gt, rgb_pred).mean(),
-                f"ssim_ours": compute_ssim(rgb_gt, rgb_pred).mean(),
-                f"psnr_ours": compute_psnr(rgb_gt, rgb_pred).mean(),
-            }
-            methods = ['ours']
+        ### compute correlation
+        signal = sat_feat.reshape(1, -1, A, A)
+        kernel = g2s_feat * g2s_conf.pow(2)
+        corr = F.conv2d(signal, kernel, groups=b)[0]  # [B, H, W]
 
-            self.log_dict(all_metrics)
-            self.print_preview_metrics(all_metrics, methods, overlap_tag=overlap_tag)
+        sat_feat_pow = (sat_feat).pow(2).transpose(0, 1)  # [B, C, H, W]->[C, B, H, W]
+        g2s_conf_pow = g2s_conf.pow(2)
+        denominator_sat = F.conv2d(sat_feat_pow, g2s_conf_pow, groups=b).transpose(0, 1)  # [B, C, H, W]
+        denominator_sat = torch.sqrt(torch.sum(denominator_sat, dim=1))  # [B, H, W]
 
-        # Save images.
-        (scene,) = batch["scene"]
-        name = get_cfg()["wandb"]["name"]
-        path = self.test_cfg.output_path / name
-        if self.test_cfg.save_image:
-            for index, color in zip(batch["target"]["index"][0], output.color[0]):
-                save_image(color, path / scene / f"color/{index:0>6}.png")
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1)  # [B]
+        shape = denominator_sat.shape
+        denominator_grd = denom_grd[:, None, None].repeat(1, shape[1], shape[2])
+        denominator = denominator_sat * denominator_grd
+        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
+        corr = corr / denominator  # [B, H, W]
+        corr_H = int(20.0 * 3 / self.meters_per_pixel)
+        corr_W = int(20.0 * 3 / self.meters_per_pixel)
+        corr = TF.center_crop(corr[:, None], [corr_H, corr_W])[:, 0]
 
-        if self.test_cfg.save_video:
-            frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])
-            save_video(
-                [a for a in output.color[0]],
-                path / "video" / f"{scene}_frame_{frame_str}.mp4",
-            )
+        # compute pred_u and pred_v
+        max_index = torch.argmax(corr.reshape(b, -1), dim=1)
 
-        if self.test_cfg.save_compare:
-            # Construct comparison image.
-            context_img = inverse_normalize(batch["context"]["image"][0])
-            comparison = hcat(
-                add_label(vcat(*context_img), "Context"),
-                add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-                add_label(vcat(*rgb_pred), "Target (Prediction)"),
-            )
-            save_image(comparison, path / f"{scene}.png")
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lon
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lat
+
+        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0
+        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0
+        # Store pred_u and pred_v values in the lists
+        self.pred_lons.extend(pred_u.cpu().detach().numpy())
+        self.pred_lats.extend(pred_v.cpu().detach().numpy())
+        self.gt_lons.extend(gt_shift_u.cpu().detach().numpy())
+        self.gt_lats.extend(gt_shift_v.cpu().detach().numpy())
+
+        # Visualize positions on satellite image
+        self.visualize_positions_on_satellite(
+            gaussians, batch, pred_u[0], pred_v[0],
+            gt_shift_u[0].cpu().detach().numpy(),
+            gt_shift_v[0].cpu().detach().numpy()
+        )
 
     def test_step_align(self, batch, gaussians):
         self.encoder.eval()
@@ -365,327 +480,496 @@ class ModelWrapper(LightningModule):
 
         return output
 
+    def visualize_positions_on_satellite(self, gaussians, batch, pred_u, pred_v, gt_shift_u, gt_shift_v):
+        """
+        在卫星图上可视化预测位置和真实位置
+
+        Args:
+            gaussians: 高斯球的参数
+            batch: 包含卫星图像的batch
+            pred_u: 预测的u坐标（米）
+            pred_v: 预测的v坐标（米）
+            gt_shift_u: 真实的u坐标（米）
+            gt_shift_v: 真实的v坐标（米）
+        """
+        try:
+            # 获取卫星图像
+            sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
+
+            # 处理图像格式
+            if isinstance(sat_img, torch.Tensor):
+                sat_img_np = sat_img.detach().cpu().numpy()
+                # 如果是CHW格式，转换为HWC
+                if sat_img_np.shape[0] < sat_img_np.shape[2]:
+                    sat_img_np = np.transpose(sat_img_np, (1, 2, 0))
+            else:
+                sat_img_np = sat_img
+
+            # 归一化到0-255范围
+            if sat_img_np.max() <= 1.0:
+                sat_img_np = (sat_img_np * 255).astype(np.uint8)
+            else:
+                sat_img_np = sat_img_np.astype(np.uint8)
+
+            # 转换为BGR格式（OpenCV格式）
+            if sat_img_np.shape[2] == 3:
+                vis_img = cv2.cvtColor(sat_img_np, cv2.COLOR_RGB2BGR)
+            else:
+                vis_img = sat_img_np.copy()
+
+            H, W = vis_img.shape[:2]
+            center_x, center_y = W // 2, H // 2
+
+            # 米每像素的比例
+            meter_per_pixel = self.meters_per_pixel / 4
+
+            # 绘制预测位置（红色三角形）
+            if isinstance(pred_u, torch.Tensor):
+                pred_x = float(pred_u.cpu().detach().numpy())
+            else:
+                pred_x = float(pred_u)
+
+            if isinstance(pred_v, torch.Tensor):
+                pred_y = float(pred_v.cpu().detach().numpy())
+            else:
+                pred_y = float(pred_v)
+            pixel_x_pred = int(center_x + pred_x / meter_per_pixel)
+            pixel_y_pred = int(center_y + pred_y / meter_per_pixel)
+
+            triangle_size = 15
+            pred_triangle = np.array([
+                [pixel_x_pred, pixel_y_pred - triangle_size],
+                [pixel_x_pred - triangle_size//2, pixel_y_pred + triangle_size//2],
+                [pixel_x_pred + triangle_size//2, pixel_y_pred + triangle_size//2]
+            ], dtype=np.int32)
+
+            cv2.fillPoly(vis_img, [pred_triangle], (0, 0, 255))  # 红色填充
+            cv2.polylines(vis_img, [pred_triangle], True, (255, 255, 255), 2)  # 白色边框
+
+            # 绘制真实位置（绿色三角形）
+            gt_x = float(gt_shift_u)
+            gt_y = float(gt_shift_v)
+
+            pixel_x_gt = int(center_x + gt_x / meter_per_pixel)
+            pixel_y_gt = int(center_y + gt_y / meter_per_pixel)
+
+            gt_triangle = np.array([
+                [pixel_x_gt, pixel_y_gt - triangle_size],
+                [pixel_x_gt - triangle_size//2, pixel_y_gt + triangle_size//2],
+                [pixel_x_gt + triangle_size//2, pixel_y_gt + triangle_size//2]
+            ], dtype=np.int32)
+
+            cv2.fillPoly(vis_img, [gt_triangle], (0, 255, 0))  # 绿色填充
+            cv2.polylines(vis_img, [gt_triangle], True, (255, 255, 255), 2)  # 白色边框
+
+            # 添加图例
+            legend_y = 30
+            cv2.rectangle(vis_img, (10, legend_y-20), (250, legend_y+40), (0, 0, 0), -1)  # 黑色背景
+            cv2.putText(vis_img, "Position Visualization", (15, legend_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.fillPoly(vis_img, [np.array([[25, legend_y+5], [35, legend_y-5], [45, legend_y+5]])], (0, 0, 255))
+            cv2.putText(vis_img, "Predicted", (55, legend_y+5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.fillPoly(vis_img, [np.array([[25, legend_y+20], [35, legend_y+10], [45, legend_y+20]])], (0, 255, 0))
+            cv2.putText(vis_img, "Ground Truth", (55, legend_y+20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+            # 创建保存目录
+            save_dir = "./camera_position_visualization"
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "camera_pos.png")
+
+            # 保存图像
+            cv2.imwrite(save_path, vis_img)
+
+            ###### 保存原始卫星图 ######
+            # 定义红点的半径（可以根据需要调整）
+            radius = 5
+            sat_img = F.interpolate(batch['sat']['sat_align'], size=(H, W), mode='bilinear', align_corners=False)
+            test_img = to_pil_image(sat_img[0])
+            # 创建一个可以在图像上绘图的对象
+            draw = ImageDraw.Draw(test_img)
+
+            # 绘制一个红色圆形作为中心点
+            # draw.ellipse((x1, y1, x2, y2), fill=color, outline=color)
+            # x1, y1 是左上角坐标，x2, y2 是右下角坐标
+            draw.ellipse((center_x - radius, center_y - radius,
+                        center_x + radius, center_y + radius),
+                        fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
+            test_img.save(os.path.join(save_dir, 'sat.png'))
+
+            ###### 保存输入地面图 ######
+            rgb_input = (batch['context']["image"][0,0] + 1) / 2
+            test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
+            test_img.save(os.path.join(save_dir, 'input.png'))
+
+            ###### 保存Bev投影地面图 ######
+            point_color = (rearrange(batch["context"]["image"], 'b v c h w -> b (v h w) c') + 1) / 2
+            point_clouds = gaussians.means
+            grd2sat_direct_color = forward_project(
+                point_color,
+                point_clouds,
+                meter_per_pixel=0.2
+            )
+            rgb_bev = grd2sat_direct_color[0]
+            test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+            # 创建一个可以在图像上绘图的对象
+            draw = ImageDraw.Draw(test_img)
+            # 绘制一个红色圆形作为中心点
+            # draw.ellipse((x1, y1, x2, y2), fill=color, outline=color)
+            # x1, y1 是左上角坐标，x2, y2 是右下角坐标
+            draw.ellipse((center_x - radius, center_y - radius,
+                        center_x + radius, center_y + radius),
+                        fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
+            # 保存图片
+            test_img.save('direct_bev.png')
+
+        except Exception as e:
+            print(f"Error in position visualization: {e}")
+
     def on_test_end(self) -> None:
         name = get_cfg()["wandb"]["name"]
-        self.benchmarker.dump(self.test_cfg.output_path / name / "benchmark.json")
+        save_path = self.test_cfg.output_path / name
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        self.benchmarker.dump(save_path / "benchmark.json")
         self.benchmarker.dump_memory(
-            self.test_cfg.output_path / name / "peak_memory.json"
+            save_path / "peak_memory.json"
         )
         self.benchmarker.summarize()
+
+        # Calculate and print evaluation metrics if we have predictions
+        if self.pred_lons and self.pred_lats and self.gt_lons and self.gt_lats:
+            try:
+                # Convert lists to numpy arrays
+                pred_lons = np.array(self.pred_lons)
+                pred_lats = np.array(self.pred_lats)
+                gt_lons = np.array(self.gt_lons)
+                gt_lats = np.array(self.gt_lats)
+
+                # Calculate evaluation metrics
+                distance = np.sqrt((pred_lons - gt_lons) ** 2 + (pred_lats - gt_lats) ** 2)
+                init_dis = np.sqrt(gt_lats ** 2 + gt_lons ** 2)
+                diff_lats = np.abs(pred_lats - gt_lats)
+                diff_lons = np.abs(pred_lons - gt_lons)
+
+                # Get benchmark timing info
+                # avg_time_per_image = self.benchmarker.get_avg_time("encoder") + self.benchmarker.get_avg_time("decoder")
+
+                # Save results to .mat file
+                scio.savemat(save_path / 'test_results.mat', {
+                    'gt_lons': gt_lons,
+                    'gt_lats': gt_lats,
+                    'pred_lats': pred_lats,
+                    'pred_lons': pred_lons
+                })
+
+                # Write results to text file
+                with open(save_path / 'test_results.txt', 'w') as f:
+                    f.write('====================================\n')
+                    f.write(f'       TEST RESULTS\n')
+                    f.write('====================================\n')
+
+                    print('====================================')
+                    print('       TEST RESULTS')
+                    print('====================================')
+
+                    # Timing info
+                    # line = f'Time per image (second): {avg_time_per_image:.4f}\n'
+                    # print(line, end='')
+                    # f.write(line)
+
+                    # Distance metrics
+                    line = f'Distance average: {np.mean(init_dis):.4f} (init) -> {np.mean(distance):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    line = f'Distance median: {np.median(init_dis):.4f} (init) -> {np.median(distance):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    # Lateral error
+                    line = f'Lateral average: {np.mean(np.abs(gt_lats)):.4f} (init) -> {np.mean(diff_lats):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    line = f'Lateral median: {np.median(np.abs(gt_lats)):.4f} (init) -> {np.median(diff_lats):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    # Longitudinal error
+                    line = f'Longitudinal average: {np.mean(np.abs(gt_lons)):.4f} (init) -> {np.mean(diff_lons):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    line = f'Longitudinal median: {np.median(np.abs(gt_lons)):.4f} (init) -> {np.median(diff_lons):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    print('\n-------------------------')
+                    f.write('\n-------------------------\n')
+
+                    # Accuracy metrics
+                    metrics = [1, 3, 5]
+                    for threshold in metrics:
+                        pred_acc = np.sum(distance < threshold) / distance.shape[0] * 100
+                        init_acc = np.sum(init_dis < threshold) / init_dis.shape[0] * 100
+                        line = f'distance within {threshold}m: {init_acc:.2f}% (init) -> {pred_acc:.2f}% (pred)\n'
+                        print(line, end='')
+                        f.write(line)
+
+                    print('\n-------------------------')
+                    f.write('\n-------------------------\n')
+
+                    # Lateral accuracy
+                    for threshold in metrics:
+                        pred_acc = np.sum(diff_lats < threshold) / diff_lats.shape[0] * 100
+                        init_acc = np.sum(np.abs(gt_lats) < threshold) / gt_lats.shape[0] * 100
+                        line = f'lateral within {threshold}m: {init_acc:.2f}% (init) -> {pred_acc:.2f}% (pred)\n'
+                        print(line, end='')
+                        f.write(line)
+
+                    print('\n-------------------------')
+                    f.write('\n-------------------------\n')
+
+                    # Longitudinal accuracy
+                    for threshold in metrics:
+                        pred_acc = np.sum(diff_lons < threshold) / diff_lons.shape[0] * 100
+                        init_acc = np.sum(np.abs(gt_lons) < threshold) / gt_lons.shape[0] * 100
+                        line = f'longitudinal within {threshold}m: {init_acc:.2f}% (init) -> {pred_acc:.2f}% (pred)\n'
+                        print(line, end='')
+                        f.write(line)
+
+                    print('\n-------------------------')
+                    f.write('\n-------------------------\n')
+
+                print(f"Test results saved to {save_path}")
+
+            except Exception as e:
+                print(f"Error calculating test metrics: {e}")
+
+            # Reset lists for next test run
+            self.pred_lons = []
+            self.pred_lats = []
+            self.gt_lons = []
+            self.gt_lats = []
+
+    def on_validation_epoch_end(self) -> None:
+        """在每个验证epoch结束时执行，与on_test_end相同的操作"""
+        # 获取当前epoch
+        current_epoch = self.current_epoch
+
+        # 获取输出目录
+        try:
+            name = get_cfg()["wandb"]["name"]
+            # 使用验证特有的目录
+            save_path = self.test_cfg.output_path / f"{name}_val_epoch_{current_epoch + 1}"
+            save_path.mkdir(parents=True, exist_ok=True)
+        except:
+            # 如果获取配置失败，使用默认路径
+            save_path = Path("outputs") / f"val_epoch_{current_epoch + 1}"
+            save_path.mkdir(parents=True, exist_ok=True)
+
+        # Calculate and print evaluation metrics if we have predictions
+        if self.pred_lons and self.pred_lats and self.gt_lons and self.gt_lats:
+            try:
+                print(f"\n=== Validation Epoch {current_epoch + 1} Results ===")
+
+                # Convert lists to numpy arrays
+                pred_lons = np.array(self.pred_lons)
+                pred_lats = np.array(self.pred_lats)
+                gt_lons = np.array(self.gt_lons)
+                gt_lats = np.array(self.gt_lats)
+
+                # Calculate evaluation metrics
+                distance = np.sqrt((pred_lons - gt_lons) ** 2 + (pred_lats - gt_lats) ** 2)
+                init_dis = np.sqrt(gt_lats ** 2 + gt_lons ** 2)
+                diff_lats = np.abs(pred_lats - gt_lats)
+                diff_lons = np.abs(pred_lons - gt_lons)
+
+                # Save results to .mat file
+                scio.savemat(save_path / 'val_results.mat', {
+                    'gt_lons': gt_lons,
+                    'gt_lats': gt_lats,
+                    'pred_lats': pred_lats,
+                    'pred_lons': pred_lons
+                })
+
+                # Write results to text file
+                with open(save_path / 'val_results.txt', 'w') as f:
+                    f.write('====================================\n')
+                    f.write(f'  VALIDATION EPOCH {current_epoch + 1} RESULTS\n')
+                    f.write('====================================\n')
+
+                    print('====================================')
+                    print(f'  VALIDATION EPOCH {current_epoch + 1} RESULTS')
+                    print('====================================')
+
+                    # Distance metrics
+                    line = f'Distance average: {np.mean(init_dis):.4f} (init) -> {np.mean(distance):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    line = f'Distance median: {np.median(init_dis):.4f} (init) -> {np.median(distance):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    # Lateral error
+                    line = f'Lateral average: {np.mean(np.abs(gt_lats)):.4f} (init) -> {np.mean(diff_lats):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    line = f'Lateral median: {np.median(np.abs(gt_lats)):.4f} (init) -> {np.median(diff_lats):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    # Longitudinal error
+                    line = f'Longitudinal average: {np.mean(np.abs(gt_lons)):.4f} (init) -> {np.mean(diff_lons):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    line = f'Longitudinal median: {np.median(np.abs(gt_lons)):.4f} (init) -> {np.median(diff_lons):.4f} (pred)\n'
+                    print(line, end='')
+                    f.write(line)
+
+                    print('\n-------------------------')
+                    f.write('\n-------------------------\n')
+
+                    # Accuracy metrics
+                    metrics = [1, 3, 5]
+                    for threshold in metrics:
+                        pred_acc = np.sum(distance < threshold) / distance.shape[0] * 100
+                        init_acc = np.sum(init_dis < threshold) / init_dis.shape[0] * 100
+                        line = f'distance within {threshold}m: {init_acc:.2f}% (init) -> {pred_acc:.2f}% (pred)\n'
+                        print(line, end='')
+                        f.write(line)
+
+                    print('\n-------------------------')
+                    f.write('\n-------------------------\n')
+
+                print(f"Validation epoch {current_epoch + 1} results saved to {save_path}")
+
+            except Exception as e:
+                print(f"Error calculating validation metrics: {e}")
+
+            # Reset lists for next validation run
+            self.pred_lons = []
+            self.pred_lats = []
+            self.gt_lons = []
+            self.gt_lats = []
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         batch: BatchedExample = self.data_shim(batch)
 
-        if self.global_rank == 0:
-            print(
-                f"validation step {self.global_step}; "
-                f"scene = {batch['scene']}; "
-                f"context = {batch['context']['index'].tolist()}"
-            )
+        b, v, _, h, w = batch["target"]["image"].shape
+
+        feat_img = batch["context"]["feat_image"]
+        grd_img = batch["context"]["image"]
+        b, v, _, h, w = grd_img.shape
+        feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
+        sat_img = batch["sat"]["sat"]
+
+        if batch_idx % 100 == 0:
+            print(f"Test step {batch_idx:0>6}.")
+
+        # extract grd and sat feature
+        with torch.no_grad():
+            # dino
+            sat_feat = self.dino_feat(sat_img)
+            grd_feat = self.dino_feat(feat_img)
+            if isinstance(sat_feat, (tuple, list)):
+                sat_feats = [_f.detach() for _f in sat_feat]
+            if isinstance(grd_feat, (tuple, list)):
+                grd_feats = [_f.detach() for _f in grd_feat]
+
+        # dpt
+        sat_feat, sat_conf = self.dpt(sat_feats)
+        grd_feat, grd_conf = self.dpt(grd_feats)
+        A = sat_feat.shape[-1]
 
         # Render Gaussians.
-        b, _, _, h, w = batch["target"]["image"].shape
-        assert b == 1
-        visualization_dump = {}
-        gaussians = self.encoder(
-            batch["context"],
-            self.global_step,
-            visualization_dump=visualization_dump,
-        )
-        output = self.decoder.forward(
-            gaussians,
-            batch["target"]["extrinsics"],
-            batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
-            (h, w),
-            "depth",
-        )
-        rgb_pred = output.color[0]
-        depth_pred = vis_depth_map(output.depth[0])
+        with self.benchmarker.time("encoder"):
+            gaussians = self.encoder(
+                batch["context"],
+                self.global_step,
+            )
 
-        # direct depth from gaussian means (used for visualization only)
-        gaussian_means = visualization_dump["depth"][0].squeeze()
-        if gaussian_means.shape[-1] == 3:
-            gaussian_means = gaussian_means.mean(dim=-1)
+        gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
+        gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
 
-        # Compute validation metrics.
-        rgb_gt = batch["target"]["image"][0]
-        psnr = compute_psnr(rgb_gt, rgb_pred).mean()
-        self.log(f"val/psnr", psnr)
-        lpips = compute_lpips(rgb_gt, rgb_pred).mean()
-        self.log(f"val/lpips", lpips)
-        ssim = compute_ssim(rgb_gt, rgb_pred).mean()
-        self.log(f"val/ssim", ssim)
-
-        # Construct comparison image.
-        context_img = inverse_normalize(batch["context"]["image"][0])
-        context_img_depth = vis_depth_map(gaussian_means)
-        context = []
-        for i in range(context_img.shape[0]):
-            context.append(context_img[i])
-            context.append(context_img_depth[i])
-        comparison = hcat(
-            add_label(vcat(*context), "Context"),
-            add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-            add_label(vcat(*rgb_pred), "Target (Prediction)"),
-            add_label(vcat(*depth_pred), "Depth (Prediction)"),
-        )
-
-        if self.distiller is not None:
-            with torch.no_grad():
-                pseudo_gt1, pseudo_gt2 = self.distiller(batch["context"], False)
-            depth1, depth2 = pseudo_gt1['pts3d'][..., -1], pseudo_gt2['pts3d'][..., -1]
-            conf1, conf2 = pseudo_gt1['conf'], pseudo_gt2['conf']
-            depth_dust = torch.cat([depth1, depth2], dim=0)
-            depth_dust = vis_depth_map(depth_dust)
-            conf_dust = torch.cat([conf1, conf2], dim=0)
-            conf_dust = confidence_map(conf_dust)
-            dust_vis = torch.cat([depth_dust, conf_dust], dim=0)
-            comparison = hcat(add_label(vcat(*dust_vis), "Context"), comparison)
-
-        self.logger.log_image(
-            "comparison",
-            [prep_image(add_border(comparison))],
-            step=self.global_step,
-            caption=batch["scene"],
-        )
-
-        # Render projections and construct projection image.
-        # These are disabled for now, since RE10k scenes are effectively unbounded.
-        projections = hcat(
-                *render_projections(
+        # align the target pose
+        if self.test_cfg.align_pose:
+            output = self.test_step_align(batch, gaussians)
+        else:
+            with self.benchmarker.time("decoder", num_calls=v):
+                output = self.decoder.forward(
                     gaussians,
-                    256,
-                    extra_label="",
-                )[0]
-            )
-        self.logger.log_image(
-            "projection",
-            [prep_image(add_border(projections))],
-            step=self.global_step,
-        )
-
-        # # Draw cameras.
-        # cameras = hcat(*render_cameras(batch, 256))
-        # self.logger.log_image(
-        #     "cameras", [prep_image(add_border(cameras))], step=self.global_step
-        # )
-
-        # if self.encoder_visualizer is not None:
-        #     for k, image in self.encoder_visualizer.visualize(
-        #         batch["context"], self.global_step
-        #     ).items():
-        #         self.logger.log_image(k, [prep_image(image)], step=self.global_step)
-
-        # # Run video validation step.
-        # self.render_video_interpolation(batch)
-        # self.render_video_wobble(batch)
-        # if self.train_cfg.extended_visualization:
-        #     self.render_video_interpolation_exaggerated(batch)
-
-    @rank_zero_only
-    def render_video_wobble(self, batch: BatchedExample) -> None:
-        # Two views are needed to get the wobble radius.
-        _, v, _, _ = batch["context"]["extrinsics"].shape
-        if v != 2:
-            return
-
-        def trajectory_fn(t):
-            origin_a = batch["context"]["extrinsics"][:, 0, :3, 3]
-            origin_b = batch["context"]["extrinsics"][:, 1, :3, 3]
-            delta = (origin_a - origin_b).norm(dim=-1)
-            extrinsics = generate_wobble(
-                batch["context"]["extrinsics"][:, 0],
-                delta * 0.25,
-                t,
-            )
-            intrinsics = repeat(
-                batch["context"]["intrinsics"][:, 0],
-                "b i j -> b v i j",
-                v=t.shape[0],
-            )
-            return extrinsics, intrinsics
-
-        return self.render_video_generic(batch, trajectory_fn, "wobble", num_frames=60)
-
-    @rank_zero_only
-    def render_video_interpolation(self, batch: BatchedExample) -> None:
-        _, v, _, _ = batch["context"]["extrinsics"].shape
-
-        def trajectory_fn(t):
-            extrinsics = interpolate_extrinsics(
-                batch["context"]["extrinsics"][0, 0],
-                (
-                    batch["context"]["extrinsics"][0, 1]
-                    if v == 2
-                    else batch["target"]["extrinsics"][0, 0]
-                ),
-                t,
-            )
-            intrinsics = interpolate_intrinsics(
-                batch["context"]["intrinsics"][0, 0],
-                (
-                    batch["context"]["intrinsics"][0, 1]
-                    if v == 2
-                    else batch["target"]["intrinsics"][0, 0]
-                ),
-                t,
-            )
-            return extrinsics[None], intrinsics[None]
-
-        return self.render_video_generic(batch, trajectory_fn, "rgb")
-
-    @rank_zero_only
-    def render_video_interpolation_exaggerated(self, batch: BatchedExample) -> None:
-        # Two views are needed to get the wobble radius.
-        _, v, _, _ = batch["context"]["extrinsics"].shape
-        if v != 2:
-            return
-
-        def trajectory_fn(t):
-            origin_a = batch["context"]["extrinsics"][:, 0, :3, 3]
-            origin_b = batch["context"]["extrinsics"][:, 1, :3, 3]
-            delta = (origin_a - origin_b).norm(dim=-1)
-            tf = generate_wobble_transformation(
-                delta * 0.5,
-                t,
-                5,
-                scale_radius_with_t=False,
-            )
-            extrinsics = interpolate_extrinsics(
-                batch["context"]["extrinsics"][0, 0],
-                (
-                    batch["context"]["extrinsics"][0, 1]
-                    if v == 2
-                    else batch["target"]["extrinsics"][0, 0]
-                ),
-                t * 5 - 2,
-            )
-            intrinsics = interpolate_intrinsics(
-                batch["context"]["intrinsics"][0, 0],
-                (
-                    batch["context"]["intrinsics"][0, 1]
-                    if v == 2
-                    else batch["target"]["intrinsics"][0, 0]
-                ),
-                t * 5 - 2,
-            )
-            return extrinsics @ tf, intrinsics[None]
-
-        return self.render_video_generic(
-            batch,
-            trajectory_fn,
-            "interpolation_exagerrated",
-            num_frames=300,
-            smooth=False,
-            loop_reverse=False,
-        )
-
-    @rank_zero_only
-    def render_video_generic(
-        self,
-        batch: BatchedExample,
-        trajectory_fn: TrajectoryFn,
-        name: str,
-        num_frames: int = 30,
-        smooth: bool = True,
-        loop_reverse: bool = True,
-    ) -> None:
-        # Render probabilistic estimate of scene.
-        gaussians = self.encoder(batch["context"], self.global_step)
-
-        t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)
-        if smooth:
-            t = (torch.cos(torch.pi * (t + 1)) + 1) / 2
-
-        extrinsics, intrinsics = trajectory_fn(t)
-
-        _, _, _, h, w = batch["context"]["image"].shape
-
-        # TODO: Interpolate near and far planes?
-        near = repeat(batch["context"]["near"][:, 0], "b -> b v", v=num_frames)
-        far = repeat(batch["context"]["far"][:, 0], "b -> b v", v=num_frames)
-        output = self.decoder.forward(
-            gaussians, extrinsics, intrinsics, near, far, (h, w), "depth"
-        )
-        images = [
-            vcat(rgb, depth)
-            for rgb, depth in zip(output.color[0], vis_depth_map(output.depth[0]))
-        ]
-
-        video = torch.stack(images)
-        video = (video.clip(min=0, max=1) * 255).type(torch.uint8).cpu().numpy()
-        if loop_reverse:
-            video = pack([video, video[::-1][1:-1]], "* c h w")[0]
-        visualizations = {
-            f"video/{name}": wandb.Video(video[None], fps=30, format="mp4")
-        }
-
-        # Since the PyTorch Lightning doesn't support video logging, log to wandb directly.
-        try:
-            wandb.log(visualizations)
-        except Exception:
-            assert isinstance(self.logger, LocalLogger)
-            for key, value in visualizations.items():
-                tensor = value._prepare_video(value.data)
-                clip = mpy.ImageSequenceClip(list(tensor), fps=value._fps)
-                dir = LOG_PATH / key
-                dir.mkdir(exist_ok=True, parents=True)
-                clip.write_videofile(
-                    str(dir / f"{self.global_step:0>6}.mp4"), logger=None
+                    batch["target"]["extrinsics"],
+                    batch["target"]["intrinsics"],
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (h, w),
                 )
 
-    def print_preview_metrics(self, metrics: dict[str, float | Tensor], methods: list[str] | None = None, overlap_tag: str | None = None) -> None:
-        if getattr(self, "running_metrics", None) is None:
-            self.running_metrics = metrics
-            self.running_metric_steps = 1
-        else:
-            s = self.running_metric_steps
-            self.running_metrics = {
-                k: ((s * v) + metrics[k]) / (s + 1)
-                for k, v in self.running_metrics.items()
-            }
-            self.running_metric_steps += 1
+        # get gaussian bev
+        heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
+        grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
+            gaussians, 
+            (A, A),
+            heading=heading, 
+            width=100.0, 
+            height=100.0
+        )
+        crop_H = int(A - 20 * 3 / self.meters_per_pixel)
+        crop_W = int(A - 20 * 3 / self.meters_per_pixel)
+        g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
 
-        if overlap_tag is not None:
-            if getattr(self, "running_metrics_sub", None) is None:
-                self.running_metrics_sub = {overlap_tag: metrics}
-                self.running_metric_steps_sub = {overlap_tag: 1}
-            elif overlap_tag not in self.running_metrics_sub:
-                self.running_metrics_sub[overlap_tag] = metrics
-                self.running_metric_steps_sub[overlap_tag] = 1
-            else:
-                s = self.running_metric_steps_sub[overlap_tag]
-                self.running_metrics_sub[overlap_tag] = {k: ((s * v) + metrics[k]) / (s + 1)
-                                                         for k, v in self.running_metrics_sub[overlap_tag].items()}
-                self.running_metric_steps_sub[overlap_tag] += 1
+        rgb_bev = grd2sat_color[0]
+        test_img = to_pil_image(rgb_bev)
+        test_img.save('splat_bev.png')
 
-        metric_list = ["psnr", "lpips", "ssim"]
+        ### compute correlation
+        signal = sat_feat.reshape(1, -1, A, A)
+        kernel = g2s_feat * g2s_conf.pow(2)
+        corr = F.conv2d(signal, kernel, groups=b)[0]  # [B, H, W]
 
-        def print_metrics(runing_metric, methods=None):
-            table = []
-            if methods is None:
-                methods = ['ours']
+        sat_feat_pow = (sat_feat).pow(2).transpose(0, 1)  # [B, C, H, W]->[C, B, H, W]
+        g2s_conf_pow = g2s_conf.pow(2)
+        denominator_sat = F.conv2d(sat_feat_pow, g2s_conf_pow, groups=b).transpose(0, 1)  # [B, C, H, W]
+        denominator_sat = torch.sqrt(torch.sum(denominator_sat, dim=1))  # [B, H, W]
 
-            for method in methods:
-                row = [
-                    f"{runing_metric[f'{metric}_{method}']:.3f}"
-                    for metric in metric_list
-                ]
-                table.append((method, *row))
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1)  # [B]
+        shape = denominator_sat.shape
+        denominator_grd = denom_grd[:, None, None].repeat(1, shape[1], shape[2])
+        denominator = denominator_sat * denominator_grd
+        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
+        corr = corr / denominator  # [B, H, W]
+        corr_H = int(20.0 * 3 / self.meters_per_pixel)
+        corr_W = int(20.0 * 3 / self.meters_per_pixel)
+        corr = TF.center_crop(corr[:, None], [corr_H, corr_W])[:, 0]
 
-            headers = ["Method"] + metric_list
-            table = tabulate(table, headers)
-            print(table)
+        # compute pred_u and pred_v
+        max_index = torch.argmax(corr.reshape(b, -1), dim=1)
 
-        print("All Pairs:")
-        print_metrics(self.running_metrics, methods)
-        if overlap_tag is not None:
-            for k, v in self.running_metrics_sub.items():
-                print(f"Overlap: {k}")
-                print_metrics(v, methods)
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lon
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lat
+
+        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0
+        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0
+        # Store pred_u and pred_v values in the lists
+        self.pred_lons.extend(pred_u.cpu().detach().numpy())
+        self.pred_lats.extend(pred_v.cpu().detach().numpy())
+        self.gt_lons.extend(gt_shift_u.cpu().detach().numpy())
+        self.gt_lats.extend(gt_shift_v.cpu().detach().numpy())
+
+        # Visualize positions on satellite image
+        self.visualize_positions_on_satellite(
+            gaussians, batch, pred_u[0], pred_v[0],
+            gt_shift_u[0].cpu().detach().numpy(),
+            gt_shift_v[0].cpu().detach().numpy()
+        )
 
     def configure_optimizers(self):
         new_params, new_param_names = [], []

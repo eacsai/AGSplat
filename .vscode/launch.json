@@ -45,6 +45,22 @@
                 // "wandb.mode=disabled"
             ],
             "console": "integratedTerminal"
-        }
+        },
+        {
+            "name": "Run kitti test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "+experiment=kitti",
+                "mode=test",
+                "wandb.mode=disabled",
+                "checkpointing.load=./checkpoints/initial_weights.ckpt",
+                "wandb.name=kitti",
+            ],
+            "console": "integratedTerminal",
+            // --- 添加下面这一行 ---
+            "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
+        },
     ]
 }

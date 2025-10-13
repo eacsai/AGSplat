@@ -67,7 +67,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         super().__init__(cfg)
 
         self.backbone = get_backbone(cfg.backbone, 3)
-
+        self.backbone.eval()
         self.pose_free = cfg.pose_free
         if debug:
             self.gaussian_adapter = DebugGaussianAdapter(cfg.gaussian_adapter)
@@ -84,6 +84,17 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         self.set_center_head(output_mode='pts3d', head_type='dpt', landscape_only=True,
                            depth_mode=('exp', -inf, inf), conf_mode=None,)
         self.set_gs_params_head(cfg, cfg.gs_params_head_type)
+
+        print("Freezing backbone and center heads (downstream_head1, downstream_head2)...")
+        # 冻结 self.backbone
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        
+        # 冻结 self.downstream_head1 和 self.downstream_head2
+        for param in self.downstream_head1.parameters():
+            param.requires_grad = False
+        for param in self.downstream_head2.parameters():
+            param.requires_grad = False
 
     def set_center_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -146,13 +157,20 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
+        mask = rearrange(context['mask'], 'b v h w -> b v (h w)')[..., None, None]
 
-        # Encode the context images.
-        dec1, dec2, shape1, shape2, view1, view2 = self.backbone(context, return_views=True)
+        # 使用 torch.no_grad() 上下文管理器
+        with torch.no_grad():
+            # 在这个代码块中，所有操作都不会被追踪梯度
+            # Encode the context images.
+            dec1, dec2, shape1, shape2, view1, view2 = self.backbone(context, return_views=True)
+            
+            # 这里的 .float() 操作也应该在 no_grad 块内
+            with torch.cuda.amp.autocast(enabled=False):
+                res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
+                res2 = self._downstream_head(2, [tok.float() for tok in dec2], shape2)
+
         with torch.cuda.amp.autocast(enabled=False):
-            res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
-            res2 = self._downstream_head(2, [tok.float() for tok in dec2], shape2)
-
             # for the 3DGS heads
             if self.gs_params_head_type == 'linear':
                 GS_res1 = rearrange_head(self.gaussian_param_head(dec1[-1]), self.patch_size, h, w)
@@ -173,7 +191,11 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         pts3d2 = res2['pts3d']
         pts3d2 = rearrange(pts3d2, "b h w d -> b (h w) d")
         pts_all = torch.stack((pts3d1, pts3d2), dim=1)
+
+        min_depth = torch.min(pts_all.masked_fill(~mask.squeeze(-1).bool(), float('inf'))[..., 2], dim=-1).values.clamp(min=0)
+        pts_all[..., 2] = pts_all[..., 2] - min_depth[:,:,None]
         pts_all = pts_all.unsqueeze(-2)  # for cfg.num_surfaces
+        pts_all = pts_all * mask
 
         rgb1 = view1['img']
         rgb1 = rearrange(rgb1, "b c h w -> b (h w) c")
@@ -181,8 +203,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         rgb2 = rearrange(rgb2, "b c h w -> b (h w) c")
         rgb_all = torch.stack((rgb1, rgb2), dim=1)
         rgb_all = (rgb_all.unsqueeze(-2) + 1.0) / 2.0
-        mask = rgb_all.any(dim=-1).float().unsqueeze(-1)
-        pts_all = pts_all * mask
+        rgb_all = rgb_all * mask
 
         depths = pts_all[..., -1].unsqueeze(-1)
 
@@ -246,8 +267,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 "b v r srf spp i j -> b (v r srf spp) i j",
             ),
             rearrange(
-                gaussians.harmonics,
-                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
+                (context["image"] + 1.0) / 2.0,
+                "b v c h w -> b (v h w) c 1",
             ),
             rearrange(
                 gaussians.opacities,

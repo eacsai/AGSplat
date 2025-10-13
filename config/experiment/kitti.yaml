@@ -4,7 +4,7 @@ defaults:
   - /dataset@_group_.kitti: kitti
   - override /model/encoder: noposplat
   - override /model/encoder/backbone: croco
-  - override /loss: [mse, lpips]
+  - override /loss: [bev]
 
 wandb:
   name: kitti
@@ -26,17 +26,17 @@ dataset:
       warm_up_steps: 9375
 
 optimizer:
-  lr: 2e-4
+  lr: 6.25e-5
   warm_up_steps: 125
   backbone_lr_multiplier: 0.1
 
 data_loader:
   train:
-    batch_size: 2
+    batch_size: 4
 
 trainer:
-  max_steps: 18751
-  val_check_interval: 500
+  max_epochs: 10
+  val_check_interval: 1.0
 
 checkpointing:
   every_n_train_steps: 9375

@@ -1,5 +1,14 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import warnings
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# 设置 DDP 相关环境变量来优化性能
+os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 优化内存分配
+
+# 过滤 PyTorch 的警告
+warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match bucket view strides.*")
 
 from pathlib import Path
 
@@ -30,6 +39,8 @@ with install_import_hook(
     from src.misc.LocalLogger import LocalLogger
     from src.misc.step_tracker import StepTracker
     from src.misc.wandb_tools import update_checkpoint_path
+    from src.misc.save_initial_weights_callback import SaveInitialWeightsCallback
+    from src.misc.rich_progress_callback import RichProgressBar, DatasetProgressCallback
     from src.model.decoder import get_decoder
     from src.model.encoder import get_encoder
     from src.model.model_wrapper import ModelWrapper
@@ -74,18 +85,30 @@ def train(cfg_dict: DictConfig):
     else:
         logger = LocalLogger()
 
-    # Set up checkpointing.
+    # 添加专门的测试权重保存Callback - 每个epoch保存
     callbacks.append(
         ModelCheckpoint(
-            output_dir / "checkpoints",
-            every_n_train_steps=cfg.checkpointing.every_n_train_steps,
-            save_top_k=cfg.checkpointing.save_top_k,
-            save_weights_only=cfg.checkpointing.save_weights_only,
-            monitor="info/global_step",
-            mode="max",
+            output_dir / "checkpoints" / "test_weights",
+            every_n_epochs=1,  # 每个epoch保存一次
+            save_last=True,  # 保存最后一个epoch的权重
+            save_top_k=-1,  # 保存所有epoch的权重
+            save_weights_only=True,
+            filename="epoch_{epoch:02d}-test",  # 文件名格式
+            auto_insert_metric_name=False,
         )
     )
     callbacks[-1].CHECKPOINT_EQUALS_CHAR = '_'
+
+    # Add callback to save initial weights
+    callbacks.append(SaveInitialWeightsCallback())
+
+    # 添加Rich进度条Callbacks
+    callbacks.append(RichProgressBar(
+        refresh_rate=10,  # 每10个step更新一次进度条
+    ))
+
+    # 添加数据集信息Callback
+    callbacks.append(DatasetProgressCallback())
 
     # Prepare the checkpoint for loading.
     checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
@@ -94,24 +117,21 @@ def train(cfg_dict: DictConfig):
     step_tracker = StepTracker()
 
     trainer = Trainer(
-        max_epochs=-1,
+        max_epochs=getattr(cfg.trainer, 'max_epochs', 10),  # 从配置读取max_epochs
         num_nodes=cfg.trainer.num_nodes,
         accelerator="gpu",
         logger=logger,
         devices="auto",
-        strategy=(
-            "ddp_find_unused_parameters_true"
-            if torch.cuda.device_count() > 1
-            else "auto"
-        ),
+        strategy="auto",  # 简化策略，让 PyTorch Lightning 自动选择
+        # 添加 DDP 性能优化配置
+        # use_distributed_sampler=False,  # 如果有数据加载问题可以启用
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
-        check_val_every_n_epoch=None,
-        enable_progress_bar=False,
+        enable_progress_bar=True,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
-        max_steps=cfg.trainer.max_steps,
         # plugins=[SLURMEnvironment(requeue_signal=signal.SIGUSR1)],  # Uncomment for SLURM auto resubmission.
         inference_mode=False if (cfg.mode == "test" and cfg.test.align_pose) else True,
+        num_sanity_val_steps=10,
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 

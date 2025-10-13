@@ -2,10 +2,16 @@ from math import isqrt
 from typing import Literal, Union
 
 import torch
-from diff_gaussian_rasterization import (
+# from diff_gaussian_rasterization import (
+#     GaussianRasterizationSettings,
+#     GaussianRasterizer,
+# )
+
+from feat_gaussian import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
 )
+
 from einops import einsum, rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor
@@ -92,11 +98,19 @@ def render_cuda(
     gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
     gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
+    features: Float[Tensor, "batch gaussian c"] | None = None,
+    confidences: Float[Tensor, "batch gaussian 1"] | None = None,
     scale_invariant: bool = True,
     use_sh: bool = True,
     cam_rot_delta: Float[Tensor, "batch 3"] | None = None,
     cam_trans_delta: Float[Tensor, "batch 3"] | None = None,
-) -> tuple[Float[Tensor, "batch 3 height width"], Float[Tensor, "batch height width"]]:
+) -> tuple[
+        Float[Tensor, "batch 3 height width"], 
+        Float[Tensor, "batch C height width"],
+        Float[Tensor, "batch 1 height width"],
+        Float[Tensor, "batch height width"],
+        Float[Tensor, "batch height width"],
+    ]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
     # Make sure everything is in a range where numerical issues don't appear.
@@ -130,8 +144,10 @@ def render_cuda(
     full_projection = view_matrix @ projection_matrix
 
     all_images = []
-    all_radii = []
-    all_depths = []
+    all_feature_maps = []
+    all_confidence_maps = []
+    all_masks = []
+    all_depth_maps = []
     for i in range(b):
         # Set up a tensor for the gradients of the screen-space means.
         mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
@@ -149,7 +165,7 @@ def render_cuda(
             scale_modifier=1.0,
             viewmatrix=view_matrix[i],
             projmatrix=full_projection[i],
-            projmatrix_raw=projection_matrix[i],
+            # projmatrix_raw=projection_matrix[i],
             sh_degree=degree,
             campos=extrinsics[i, :3, 3],
             prefiltered=False,  # This matches the original usage.
@@ -159,20 +175,28 @@ def render_cuda(
 
         row, col = torch.triu_indices(3, 3)
 
-        image, radii, depth, opacity, n_touched = rasterizer(
+        image, feature_map, confidence_map, mask, depth_map, _ = rasterizer(
             means3D=gaussian_means[i],
             means2D=mean_gradients,
             shs=shs[i] if use_sh else None,
             colors_precomp=None if use_sh else shs[i, :, 0, :],
+            features=features[i] if features is not None else None,
+            confidence=confidences[i] if confidences is not None else None,
             opacities=gaussian_opacities[i, ..., None],
             cov3D_precomp=gaussian_covariances[i, :, row, col],
-            theta=cam_rot_delta[i] if cam_rot_delta is not None else None,
-            rho=cam_trans_delta[i] if cam_trans_delta is not None else None,
         )
         all_images.append(image)
-        all_radii.append(radii)
-        all_depths.append(depth.squeeze(0))
-    return torch.stack(all_images), torch.stack(all_depths)
+        all_feature_maps.append(feature_map)
+        all_confidence_maps.append(confidence_map)
+        all_masks.append(mask.squeeze(0))
+        all_depth_maps.append(depth_map.squeeze(0))
+
+    all_images = torch.stack(all_images) if all_images[0] is not None else None
+    all_feature_maps = torch.stack(all_feature_maps) if all_feature_maps[0] is not None else None
+    all_confidence_maps = torch.stack(all_confidence_maps) if all_confidence_maps[0] is not None else None
+    all_masks = torch.stack(all_masks)
+    all_depth_maps = torch.stack(all_depth_maps)
+    return all_images, all_feature_maps, all_confidence_maps, all_masks, all_depth_maps
 
 
 def render_cuda_orthographic(
@@ -187,10 +211,18 @@ def render_cuda_orthographic(
     gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
     gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
+    features: Union[Float[Tensor, "batch gaussian channels"], None] = None,
+    confidences: Union[Float[Tensor, "batch gaussian 1"], None] = None,
     fov_degrees: float = 0.1,
     use_sh: bool = True,
     dump: dict | None = None,
-) -> Float[Tensor, "batch 3 height width"]:
+) -> tuple[
+        Float[Tensor, "batch 3 height width"], 
+        Float[Tensor, "batch C height width"],
+        Float[Tensor, "batch 1 height width"],
+        Float[Tensor, "batch height width"],
+        Float[Tensor, "batch height width"],
+    ]:
     b, _, _ = extrinsics.shape
     h, w = image_shape
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
@@ -228,7 +260,10 @@ def render_cuda_orthographic(
     full_projection = view_matrix @ projection_matrix
 
     all_images = []
-    all_radii = []
+    all_feature_maps = []
+    all_confidence_maps = []
+    all_masks = []
+    all_depth_maps = []
     for i in range(b):
         # Set up a tensor for the gradients of the screen-space means.
         mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
@@ -246,7 +281,6 @@ def render_cuda_orthographic(
             scale_modifier=1.0,
             viewmatrix=view_matrix[i],
             projmatrix=full_projection[i],
-            projmatrix_raw=projection_matrix[i],
             sh_degree=degree,
             campos=extrinsics[i, :3, 3],
             prefiltered=False,  # This matches the original usage.
@@ -256,17 +290,28 @@ def render_cuda_orthographic(
 
         row, col = torch.triu_indices(3, 3)
 
-        image, radii, depth, opacity, n_touched = rasterizer(
+        image, feature, confidence, mask, depth, _ = rasterizer(
             means3D=gaussian_means[i],
             means2D=mean_gradients,
             shs=shs[i] if use_sh else None,
             colors_precomp=None if use_sh else shs[i, :, 0, :],
+            features=features[i] if features is not None else None,
+            confidence=confidences[i] if confidences is not None else None,
             opacities=gaussian_opacities[i, ..., None],
             cov3D_precomp=gaussian_covariances[i, :, row, col],
         )
         all_images.append(image)
-        all_radii.append(radii)
-    return torch.stack(all_images)
+        all_feature_maps.append(feature)
+        all_confidence_maps.append(confidence)
+        all_masks.append(mask.squeeze(0))
+        all_depth_maps.append(depth.squeeze(0))
+
+    all_images = torch.stack(all_images) if all_images[0] is not None else None
+    all_feature_maps = torch.stack(all_feature_maps) if all_feature_maps[0] is not None else None
+    all_confidence_maps = torch.stack(all_confidence_maps) if all_confidence_maps[0] is not None else None
+    all_masks = torch.stack(all_masks)
+    all_depth_maps = torch.stack(all_depth_maps)
+    return all_images, all_feature_maps, all_confidence_maps, all_masks, all_depth_maps
 
 def render_bevs(
     gaussians: Gaussians,
@@ -277,7 +322,11 @@ def render_bevs(
     rot_range = 10.0,
     width = 101.0 / 2,
     height = 101.0 / 2,
-) -> Float[Tensor, "batch 3 height width"]:
+) -> tuple[
+        Float[Tensor, "batch 3 height width"],
+        Float[Tensor, "batch C height width"],
+        Float[Tensor, "batch 1 height width"],
+    ]:
     device = gaussians.means.device
     B, _, _ = gaussians.means.shape
     if heading == None:
@@ -335,7 +384,7 @@ def render_bevs(
         # extrinsics[:, right_axis, 3] = 0
         # extrinsics[:, down_axis, 3] = 0
 
-        render_out = render_cuda_orthographic(
+        color, feature, confidence, mask, depth = render_cuda_orthographic(
             extrinsics_rotated,
             torch.tensor([width], device=device, dtype=torch.float32),
             torch.tensor([height], device=device, dtype=torch.float32),
@@ -347,16 +396,15 @@ def render_bevs(
             gaussians.covariances[b:b+1],
             gaussians.harmonics[b:b+1],
             gaussians.opacities[b:b+1],
+            features=gaussians.features[b:b+1] if gaussians.features is not None else None,
+            confidences=gaussians.confidences[b:b+1] if gaussians.confidences is not None else None,
             fov_degrees=0.1,
-            use_sh=True,
+            use_sh=False,
         )
-        color = render_out
-        # feature = render_out.feature
-        # confidence = render_out.confidence
         color_out.append(color)
-        # feature_out.append(feature)
-        # confidence_out.append(confidence)
-    return torch.cat(color_out, dim=0)
+        feature_out.append(feature)
+        confidence_out.append(confidence)
+    return torch.cat(color_out, dim=0), torch.cat(feature_out, dim=0), torch.cat(confidence_out, dim=0)
 
 def forward_project(image_tensor, xyz_grd, meter_per_pixel=0.2, sat_width=512):
     B, N_points, C = image_tensor.shape
