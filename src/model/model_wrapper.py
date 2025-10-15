@@ -89,6 +89,7 @@ class TrainCfg:
     print_log_every_n_steps: int
     distiller: str
     distill_max_steps: int
+    meter_per_pixel: float
 
 
 @runtime_checkable
@@ -141,7 +142,7 @@ class ModelWrapper(LightningModule):
         self.dino_feat = DINO()
         self.dpt = DPT(self.dino_feat.feat_dim)
 
-        self.meters_per_pixel = get_meter_per_pixel() * 4  # downsampled by 4
+        self.meters_per_pixel = train_cfg.meter_per_pixel * 4  # downsampled by 4
         self.distiller = distiller
         self.distiller_loss = None
         if self.distiller is not None:
@@ -225,6 +226,7 @@ class ModelWrapper(LightningModule):
 
         rgb_bev = grd2sat_color[0]
         test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+        test_img = test_img.rotate(90, expand=True)
         test_img.save('splat_bev.png')
 
         # vis_bev(batch, gaussians, output)
@@ -532,6 +534,9 @@ class ModelWrapper(LightningModule):
             )
             rgb_bev = grd2sat_direct_color[0]
             test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+
+            # 逆时针旋转90度
+            test_img = test_img.rotate(90, expand=True)
             # 创建一个可以在图像上绘图的对象
             draw = ImageDraw.Draw(test_img)
             # 绘制一个红色圆形作为中心点

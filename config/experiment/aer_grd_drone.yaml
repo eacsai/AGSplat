@@ -1,14 +1,14 @@
 # @package _global_
 
 defaults:
-  - /dataset@_group_.kitti: kitti
+  - /dataset@_group_.aer_grd_drone: aer_grd_drone
   - override /model/encoder: noposplat
   - override /model/encoder/backbone: croco
   - override /loss: [bev]
 
 wandb:
-  name: kitti
-  tags: [kitti, 256x256]
+  name: aer_grd_drone
+  tags: [aer_grd_drone, 256x256]
 
 model:
   encoder:
@@ -16,12 +16,13 @@ model:
     pose_free: true
     intrinsics_embed_loc: encoder
     intrinsics_embed_type: token
-    pretrained_weights: './pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
+    pretrained_weights: './checkpoints/checkpoint-aerial-mast3r.pth'
+    # pretrained_weights: './pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth'
   decoder:
     make_scale_invariant: true
 
 dataset:
-  kitti:
+  aer_grd_drone:
     view_sampler:
       warm_up_steps: 9375
 
@@ -38,3 +39,6 @@ trainer:
   max_epochs: 10
   val_check_interval: 1.0
   max_steps: 20000 # 确保训练不会因为步数限制而过早停止
+
+train:
+  meter_per_pixel: 0.2

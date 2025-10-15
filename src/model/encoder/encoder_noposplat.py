@@ -186,9 +186,24 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 GS_res2 = self.gaussian_param_head2([tok.float() for tok in dec2], res2['pts3d'].permute(0, 3, 1, 2), view2['img'][:, :3], shape2[0].cpu().tolist())
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
 
-        pts3d1 = res1['pts3d']
+        extrinsics1 = context["extrinsics"][:, 0]  # cam2world [b, 4, 4]
+        pts3d1 = res1['pts3d'] * 40 # [b, h, w, 3]
+
+        # 将点云从相机坐标系转换到世界坐标系（使用转置）
+        # 应用外参变换的转置: [b, h, w, 3] @ [b, 3, 3] -> [b, h, w, 3]
+        pts3d1 = torch.einsum('bhwi,bij->bhwj', pts3d1, extrinsics1[:, :3, :3].transpose(-2, -1))
+
+        # 重排为后续处理需要的格式
         pts3d1 = rearrange(pts3d1, "b h w d -> b (h w) d")
-        pts3d2 = res2['pts3d']
+
+        extrinsics2 = context["extrinsics"][:, 0]  # cam2world [b, 4, 4]
+        pts3d2 = res2['pts3d'] * 40 # [b, h, w, 3]
+
+        # 将点云从相机坐标系转换到世界坐标系（使用转置）
+        # 应用外参变换的转置: [b, h, w, 3] @ [b, 3, 3] -> [b, h, w, 3]
+        pts3d2 = torch.einsum('bhwi,bij->bhwj', pts3d2, extrinsics2[:, :3, :3].transpose(-2, -1))
+
+        # 重排为后续处理需要的格式
         pts3d2 = rearrange(pts3d2, "b h w d -> b (h w) d")
         pts_all = torch.stack((pts3d1, pts3d2), dim=1)
 

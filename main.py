@@ -1,6 +1,6 @@
 import os
 import warnings
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 # 设置 DDP 相关环境变量来优化性能
 os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息

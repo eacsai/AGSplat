@@ -16,6 +16,20 @@
             "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
         },
         {
+            "name": "Run aer_grd_drone experiment",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "+experiment=aer_grd_drone",
+                "wandb.mode=disabled",
+                "wandb.name=aer_grd_drone"
+            ],
+            "console": "integratedTerminal",
+            // --- 添加下面这一行 ---
+            "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
+        },
+        {
             "name": "Run kitti experiment",
             "type": "debugpy",
             "request": "launch",

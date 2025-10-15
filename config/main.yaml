@@ -22,14 +22,14 @@ data_loader:
     batch_size: 8
     seed: 1234
   test:
-    num_workers: 4
+    num_workers: 1
     persistent_workers: false
     batch_size: 8
     seed: 2345
   val:
-    num_workers: 4
+    num_workers: 1
     persistent_workers: true
-    batch_size: 8
+    batch_size: 2
     seed: 3456
 
 optimizer:
@@ -39,7 +39,6 @@ optimizer:
 
 checkpointing:
   load: null
-  every_n_train_steps: 5000
   save_top_k: 1
   save_weights_only: true
 
@@ -50,6 +49,7 @@ train:
   print_log_every_n_steps: 50
   distiller: ''
   distill_max_steps: 1000000
+  meter_per_pixel: 0.19582850865299833
 
 test:
   output_path: ./outputs/test
@@ -71,7 +71,7 @@ trainer:
   check_val_every_n_epoch: 1
   max_epochs: 10
   enable_progress_bar: true
-  num_sanity_val_steps: 10
+  num_sanity_val_steps: 6
 
 hydra:
   run:
