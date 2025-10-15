@@ -52,10 +52,17 @@ SatMap_process_sidelength = 512 # 0.2 m per pixel
 
 # 将 COLMAP 坐标系 (Z向上) 转换为 OpenCV 坐标系 (Z向前)
 # 转换矩阵: 绕 X 轴旋转 π，将 Y 轴翻转，Z 轴从向上变为向前
+# colmap_to_opencv = np.array([
+#     [1, 0, 0, 0],
+#     [0, 0, -1, 0],
+#     [0, 1, 0, 0],
+#     [0, 0, 0, 1]
+# ], dtype=np.float32)
+
 colmap_to_opencv = np.array([
-    [1, 0, 0, 0],
+    [0, -1, 0, 0],
     [0, 0, -1, 0],
-    [0, 1, 0, 0],
+    [1, 0, 0, 0],
     [0, 0, 0, 1]
 ], dtype=np.float32)
 
@@ -92,7 +99,7 @@ class DatasetAerGrdDrone(IterableDataset):
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
         else:
-            with open('/data/zhongyao/aer-grd-map/test1_files.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/test_files.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
         self.final_h = self.cfg.input_image_shape[0] * 4   # 1024
@@ -149,21 +156,18 @@ class DatasetAerGrdDrone(IterableDataset):
         for line in self.file_name:
 
             if self.stage in ("train"):
-                sub, branch, name = self._parse_name(line)
+                test_line = line.split(' ')
+                grd_path, drone_path, sat_path = test_line[0], test_line[1], test_line[2]
                 gt_shift_x = np.random.uniform(-1, 1)  # --> right as positive, parallel to the heading direction
                 gt_shift_y = np.random.uniform(-1, 1)  # --> up as positive, vertical to the heading direction
                 theta = np.random.uniform(-1, 1)
             else:
                 test_line = line.split(' ')
-                line, gt_shift_x, gt_shift_y, theta = test_line[0], float(test_line[1]), float(test_line[2]), float(test_line[3])
-                sub, branch, name = self._parse_name(line)
+                grd_path, drone_path, sat_path, gt_shift_x, gt_shift_y, theta = test_line[0], test_line[1], test_line[2], float(test_line[3]), float(test_line[4]), float(test_line[5])
 
-            # 1. 地面图像
-            grd_path = line
+            # 1. 读取图像
             grd_left_feat = Image.open(grd_path).convert('RGB')
-            # drone_path = grd_path.replace('ground', 'drone')
-            # drone_img = Image.open(drone_path).convert('RGB')
-            sat_path = self._satellite_path(sub, branch, name)
+            drone_left_feat = Image.open(drone_path).convert('RGB')
             sat_img = Image.open(sat_path).convert('RGB')
 
             # 对卫星图进行4倍下采样
@@ -171,7 +175,7 @@ class DatasetAerGrdDrone(IterableDataset):
             sat_img = sat_img.resize(new_size, Image.BILINEAR)
 
             # 2. 内参与位姿
-            npz_path = line.replace('.jpeg.jpg', '.jpeg.npz')
+            npz_path = grd_path.replace('.jpeg.jpg', '.jpeg.npz')
             npz = np.load(npz_path)
             K = torch.from_numpy(npz['intrinsics'].astype(np.float32))  # (3,3)
             fx = K[0, 0] * GrdImg_W / GrdOriImg_W / self.final_w
@@ -219,24 +223,30 @@ class DatasetAerGrdDrone(IterableDataset):
 
             if self.grdimage_transform is not None:
                 grd_left_feat = self.grdimage_transform(grd_left_feat).unsqueeze(0)
+                drone_left_feat = self.grdimage_transform(drone_left_feat).unsqueeze(0)
 
             extrinsics = torch.eye(4, dtype=torch.float32)
             # 添加 batch 维度以适应 F.interpolate，然后移除
-            grd_img = F.interpolate(grd_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
 
-            mask = rearrange(grd_img, 'v c h w -> v h w c').any(dim=-1).float()
+            grd_img = F.interpolate(grd_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
+            drone_img = F.interpolate(drone_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
+            
+            grd_mask = rearrange(grd_img, 'v c h w -> v h w c').any(dim=-1).float()
+            drone_mask = rearrange(drone_img, 'v c h w -> v h w c').any(dim=-1).float()
+
             example = {
                 "context": {
                     "extrinsics": torch.stack((cam2world, cam2world), dim=0),
                     "intrinsics": torch.stack((left_camera_k, left_camera_k), dim=0),
                     "image": torch.cat((grd_img, grd_img), dim=0),
-                    "mask": torch.cat((mask, mask), dim=0),
+                    "mask": torch.cat((grd_mask, grd_mask), dim=0),
                     "feat_image": torch.cat((grd_left_feat, grd_left_feat), dim=0),
                     "near": self.get_bound("near", 1),
                     "far": self.get_bound("far", 1),
                     "index": torch.tensor([0], dtype=torch.int64),
                     "overlap": torch.tensor([0.5], dtype=torch.float32),
                     "grd_path": grd_path,
+                    "drone_path": drone_path,
                 },
                 "target": {
                     "extrinsics": extrinsics[None],

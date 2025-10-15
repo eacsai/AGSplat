@@ -140,6 +140,7 @@ class ModelWrapper(LightningModule):
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
         self.dino_feat = DINO()
+        self.dino_feat.eval()
         self.dpt = DPT(self.dino_feat.feat_dim)
 
         self.meters_per_pixel = train_cfg.meter_per_pixel * 4  # downsampled by 4
@@ -223,10 +224,9 @@ class ModelWrapper(LightningModule):
         crop_W = int(A - 20 * 3 / meter_per_pixel)
         g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
         g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
-
+        # grd2sat_color = TF.center_crop(grd2sat_color, [crop_H, crop_W])
         rgb_bev = grd2sat_color[0]
         test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
-        test_img = test_img.rotate(90, expand=True)
         test_img.save('splat_bev.png')
 
         # vis_bev(batch, gaussians, output)
@@ -413,6 +413,8 @@ class ModelWrapper(LightningModule):
             gt_shift_u: 真实的u坐标（米）
             gt_shift_v: 真实的v坐标（米）
         """
+        # write_ply(gaussians.means[0].cpu().detach().numpy(), gaussians.harmonics[0,:,:,0].cpu().detach().numpy())
+
         try:
             # 获取卫星图像
             sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
@@ -522,8 +524,10 @@ class ModelWrapper(LightningModule):
             ###### 保存输入地面图 ######
             rgb_input = (batch['context']["image"][0,0] + 1) / 2
             test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
-            test_img.save(os.path.join(save_dir, 'input.png'))
-
+            test_img.save(os.path.join(save_dir, 'input1.png'))
+            rgb_input = (batch['context']["image"][0,1] + 1) / 2
+            test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
+            test_img.save(os.path.join(save_dir, 'input2.png'))
             ###### 保存Bev投影地面图 ######
             point_color = (rearrange(batch["context"]["image"], 'b v c h w -> b (v h w) c') + 1) / 2
             point_clouds = gaussians.means
@@ -535,8 +539,6 @@ class ModelWrapper(LightningModule):
             rgb_bev = grd2sat_direct_color[0]
             test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
 
-            # 逆时针旋转90度
-            test_img = test_img.rotate(90, expand=True)
             # 创建一个可以在图像上绘图的对象
             draw = ImageDraw.Draw(test_img)
             # 绘制一个红色圆形作为中心点

@@ -176,7 +176,9 @@ table.tex
 /baselines
 /test/*
 
+/camera_position_visualization/*
 /pretrained_weights/*
 /test_img/*
 *.ply
 *.png
+*.jpg

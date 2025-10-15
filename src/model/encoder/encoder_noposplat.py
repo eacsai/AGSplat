@@ -21,7 +21,6 @@ from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, Unifie
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 
-
 inf = float('inf')
 debug = False
 
@@ -207,8 +206,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         pts3d2 = rearrange(pts3d2, "b h w d -> b (h w) d")
         pts_all = torch.stack((pts3d1, pts3d2), dim=1)
 
-        min_depth = torch.min(pts_all.masked_fill(~mask.squeeze(-1).bool(), float('inf'))[..., 2], dim=-1).values.clamp(min=0)
-        pts_all[..., 2] = pts_all[..., 2] - min_depth[:,:,None]
+        # min_depth = torch.min(pts_all.masked_fill(~mask.squeeze(-1).bool(), float('inf'))[..., 2], dim=-1).values.clamp(min=0)
+        # pts_all[..., 2] = pts_all[..., 2] - min_depth[:,:,None]
         pts_all = pts_all.unsqueeze(-2)  # for cfg.num_surfaces
         pts_all = pts_all * mask
 
@@ -219,7 +218,6 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         rgb_all = torch.stack((rgb1, rgb2), dim=1)
         rgb_all = (rgb_all.unsqueeze(-2) + 1.0) / 2.0
         rgb_all = rgb_all * mask
-
         depths = pts_all[..., -1].unsqueeze(-1)
 
         gaussians = torch.stack([GS_res1, GS_res2], dim=1)

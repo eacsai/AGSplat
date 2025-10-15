@@ -71,7 +71,7 @@ trainer:
   check_val_every_n_epoch: 1
   max_epochs: 10
   enable_progress_bar: true
-  num_sanity_val_steps: 6
+  num_sanity_val_steps: 0
 
 hydra:
   run:

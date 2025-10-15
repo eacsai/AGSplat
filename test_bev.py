@@ -107,75 +107,88 @@ def make_xz_bev(xyz_world, rgb_world, cam_center_world,
 # -------------- 批量处理函数 --------------
 def process_single_image(rgb_path, output_dir):
     """处理单个图像"""
-    try:
-        # 构建相关文件路径
-        base_name = os.path.splitext(os.path.splitext(rgb_path)[0])[0]
-        depth_path = base_name + '.jpeg.exr'
-        npz_path = base_name + '.jpeg.npz'
-        
-        if not (os.path.exists(depth_path) and os.path.exists(npz_path)):
-            print(f"警告: {os.path.basename(rgb_path)} 缺少深度图或相机参数, 已跳过。")
-            return False
-        
-        # 加载数据
-        rgb, h, w = load_rgb(rgb_path)
-        depth = load_depth_exr(depth_path)
-        K_np, T_cw_zup_np = load_camera_params(npz_path) # 这是Z轴朝上的外参
-        
-        # 【核心修改】定义从 "Z轴朝上" 到 "Y轴朝下" 的世界坐标系变换矩阵
-        # 原始坐标系(A): X-?, Y-?, Z-Up
-        # 目标坐标系(B): X->X, Y-> -Z, Z->Y  (即绕X轴顺时针旋转90度)
-        T_zup_to_ydown = torch.tensor([
-            [1, 0, 0, 0],
-            [0, 0, -1, 0],
-            [0, 1, 0, 0],
-            [0, 0, 0, 1]
-        ], dtype=torch.float32)
 
-        # 将相机外参从Z-up世界变换到Y-down世界
-        T_cw_ydown = T_zup_to_ydown @ torch.tensor(T_cw_zup_np, dtype=torch.float32)
-        
-        print(f'处理: {os.path.basename(rgb_path)}')
-        
-        # 反投影到Z-up世界坐标系
-        xyz_w_zup, rgb_w = backproject_to_world(rgb, depth, K_np, torch.tensor(T_cw_zup_np, dtype=torch.float32))
+    # 构建相关文件路径
+    base_name = os.path.splitext(os.path.splitext(rgb_path)[0])[0]
+    depth_path = base_name + '.jpeg.exr'
+    
+    # 加载数据
+    rgb, h, w = load_rgb(rgb_path)
+    if 'grd_drone_pair' in depth_path:
+        depth_path = depth_path.replace('grd_drone_pair', 'drone')
+        depth_name = depth_path.split('/')[-1]
+        grd_name = depth_name.split('_')[1] + '_'
+        depth_path = depth_path.replace(grd_name, '')
+    depth = load_depth_exr(depth_path)
+    npz_path = depth_path.replace('.exr', '.npz')
+    K_np, T_cw_zup_np = load_camera_params(npz_path) # 这是Z轴朝上的外参
+    
+    # 【核心修改】定义从 "Z轴朝上" 到 "Y轴朝下" 的世界坐标系变换矩阵
+    # 原始坐标系(A): X-?, Y-?, Z-Up
+    # 目标坐标系(B): X->X, Y-> -Z, Z->Y  (即绕X轴顺时针旋转90度)
+    T_zup_to_ydown = torch.tensor([
+        [1, 0, 0, 0],
+        [0, 0, -1, 0],
+        [0, 1, 0, 0],
+        [0, 0, 0, 1]
+    ], dtype=torch.float32)
 
-        # 【核心修改】将所有世界点从Z-up变换到Y-down
-        xyz_w_zup_h = torch.cat([xyz_w_zup, torch.ones(xyz_w_zup.shape[0], 1, device=xyz_w_zup.device)], dim=-1)
-        xyz_w_ydown_h = xyz_w_zup_h @ T_zup_to_ydown.T
-        xyz_w_ydown = xyz_w_ydown_h[:, :3]
+    # 将相机外参从Z-up世界变换到Y-down世界
+    T_cw_ydown = T_zup_to_ydown @ torch.tensor(T_cw_zup_np, dtype=torch.float32)
+    
+    print(f'处理: {os.path.basename(rgb_path)}')
+    
+    # 反投影到Z-up世界坐标系
+    xyz_w_zup, rgb_w = backproject_to_world(rgb, depth, K_np, torch.tensor(T_cw_zup_np, dtype=torch.float32))
 
-        print(f'有效世界点: {xyz_w_ydown.shape[0]}')
-        
-        # 生成BEV图像 (在新的Y-down坐标系下)
-        cam_center_ydown = T_cw_ydown[:3, 3]  # 新坐标系下的相机光心
-        bev_img = make_xz_bev(xyz_w_ydown, rgb_w, cam_center_ydown,
-                              METER_PER_PIXEL, GROUND_Y_RANGE, RADIUS_M)
-        
-        # 在BEV图像中心标记相机位置
-        cx = cy = bev_img.shape[0] // 2
-        mark_size = int(bev_img.shape[0] * 0.02) # 标记大小为图像尺寸的2%
-        bev_img[cy-mark_size:cy+mark_size+1, cx] = [255, 0, 0]
-        bev_img[cy, cx-mark_size:cx+mark_size+1] = [255, 0, 0]
+    # 【核心修改】将所有世界点从Z-up变换到Y-down
+    xyz_w_zup_h = torch.cat([xyz_w_zup, torch.ones(xyz_w_zup.shape[0], 1, device=xyz_w_zup.device)], dim=-1)
+    xyz_w_ydown_h = xyz_w_zup_h @ T_zup_to_ydown.T
+    xyz_w_ydown = xyz_w_ydown_h[:, :3]
 
-        # 保存BEV图像
-        rgb_name = rgb_path.split('/')[-1]
-        bev_save_path = os.path.join(output_dir, rgb_name)
-        Image.fromarray(bev_img).save(bev_save_path)
-        print(f'BEV保存至: {bev_save_path}')
+    print(f'有效世界点: {xyz_w_ydown.shape[0]}')
+    
+    # 生成BEV图像 (在新的Y-down坐标系下)
+    cam_center_ydown = T_cw_ydown[:3, 3]  # 新坐标系下的相机光心
+    bev_img = make_xz_bev(xyz_w_ydown, rgb_w, cam_center_ydown,
+                            METER_PER_PIXEL, GROUND_Y_RANGE, RADIUS_M)
+    
+    # 在BEV图像中心标记相机位置
+    cx = cy = bev_img.shape[0] // 2
+    mark_size = int(bev_img.shape[0] * 0.02) # 标记大小为图像尺寸的2%
+    bev_img[cy-mark_size:cy+mark_size+1, cx] = [255, 0, 0]
+    bev_img[cy, cx-mark_size:cx+mark_size+1] = [255, 0, 0]
+
+    # 在BEV图像中心画一个尺寸为图像尺寸40%的红色边框
+    box_size = int(bev_img.shape[0] * 0.4)  # 边框尺寸为图像尺寸的40%
+    half_box = box_size // 2
+    # 计算边框的坐标范围
+    y1, y2 = cy - half_box, cy + half_box
+    x1, x2 = cx - half_box, cx + half_box
+
+    # 确保坐标在图像范围内
+    y1, x1 = max(0, y1), max(0, x1)
+    y2, x2 = min(bev_img.shape[0], y2), min(bev_img.shape[1], x2)
+
+    # 画红色边框（上、下、左、右四条边）
+    bev_img[y1:y1+3, x1:x2] = [255, 0, 0]      # 上边框
+    bev_img[y2-3:y2, x1:x2] = [255, 0, 0]      # 下边框
+    bev_img[y1:y2, x1:x1+3] = [255, 0, 0]      # 左边框
+    bev_img[y1:y2, x2-3:x2] = [255, 0, 0]      # 右边框
+
+    # 保存BEV图像
+    rgb_name = rgb_path.split('/')[-1]
+    bev_save_path = os.path.join(output_dir, rgb_name)
+    Image.fromarray(bev_img).save(bev_save_path)
+    print(f'BEV保存至: {bev_save_path}')
+    
+    return True
         
-        return True
-        
-    except Exception as e:
-        import traceback
-        print(f"处理图像 {rgb_path} 时出错: {str(e)}")
-        traceback.print_exc()
-        return False
 
 def batch_process_bev():        
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     
-    rgb_path = '/data/zhongyao/aer-grd-map/0341/drone/0341_431.jpeg.jpg'
+    rgb_path = '/data/zhongyao/aer-grd-map/0070/grd_drone_pair/0070_003_228.jpg'
     process_single_image(rgb_path, OUTPUT_ROOT)
     
     print("处理完成! 成功生成BEV图像。")
