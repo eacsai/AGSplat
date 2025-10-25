@@ -150,13 +150,15 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
 
     def forward(
         self,
+        feat_size: tuple[int, int],
         context: dict,
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
-        mask = rearrange(context['mask'], 'b v h w -> b v (h w)')[..., None, None]
+        mask = F.interpolate(context['mask'], size=feat_size, mode='nearest')
+        mask = rearrange(mask, 'b v h w -> b v (h w)')[..., None, None]
 
         # 使用 torch.no_grad() 上下文管理器
         with torch.no_grad():
@@ -181,13 +183,16 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
             elif self.gs_params_head_type == 'dpt_gs':
                 GS_res1 = self.gaussian_param_head([tok.float() for tok in dec1], res1['pts3d'].permute(0, 3, 1, 2), view1['img'][:, :3], shape1[0].cpu().tolist())
+                GS_res1 = F.interpolate(GS_res1, size=feat_size, mode='bilinear', align_corners=False)
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 GS_res2 = self.gaussian_param_head2([tok.float() for tok in dec2], res2['pts3d'].permute(0, 3, 1, 2), view2['img'][:, :3], shape2[0].cpu().tolist())
+                GS_res2 = F.interpolate(GS_res2, size=feat_size, mode='bilinear', align_corners=False)
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
 
         extrinsics1 = context["extrinsics"][:, 0]  # cam2world [b, 4, 4]
         pts3d1 = res1['pts3d'] * 40 # [b, h, w, 3]
 
+        pts3d1 = F.interpolate(pts3d1.permute(0, 3, 1, 2), size=feat_size, mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
         # 将点云从相机坐标系转换到世界坐标系（使用转置）
         # 应用外参变换的转置: [b, h, w, 3] @ [b, 3, 3] -> [b, h, w, 3]
         pts3d1 = torch.einsum('bhwi,bij->bhwj', pts3d1, extrinsics1[:, :3, :3].transpose(-2, -1))
@@ -198,6 +203,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         extrinsics2 = context["extrinsics"][:, 0]  # cam2world [b, 4, 4]
         pts3d2 = res2['pts3d'] * 40 # [b, h, w, 3]
 
+        pts3d2 = F.interpolate(pts3d2.permute(0, 3, 1, 2), size=feat_size, mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
         # 将点云从相机坐标系转换到世界坐标系（使用转置）
         # 应用外参变换的转置: [b, h, w, 3] @ [b, 3, 3] -> [b, h, w, 3]
         pts3d2 = torch.einsum('bhwi,bij->bhwj', pts3d2, extrinsics2[:, :3, :3].transpose(-2, -1))
@@ -212,17 +218,19 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         pts_all = pts_all * mask
 
         rgb1 = view1['img']
+        rgb1 = F.interpolate(rgb1, size=feat_size, mode='bilinear', align_corners=False)
         rgb1 = rearrange(rgb1, "b c h w -> b (h w) c")
         rgb2 = view2['img']
+        rgb2 = F.interpolate(rgb2, size=feat_size, mode='bilinear', align_corners=False)
         rgb2 = rearrange(rgb2, "b c h w -> b (h w) c")
-        rgb_all = torch.stack((rgb1, rgb2), dim=1)
-        rgb_all = (rgb_all.unsqueeze(-2) + 1.0) / 2.0
+        rgb_all = torch.stack((rgb1, rgb2), dim=1) # [b v (h w) c]
+        rgb_all = (rgb_all.unsqueeze(-2) + 1.0) / 2.0 # [b v (h w) 1 c]
         rgb_all = rgb_all * mask
         depths = pts_all[..., -1].unsqueeze(-1)
 
         gaussians = torch.stack([GS_res1, GS_res2], dim=1)
         gaussians = rearrange(gaussians, "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces)
-        densities = gaussians[..., 0].sigmoid().unsqueeze(-1)
+        densities = gaussians[..., 0].sigmoid().unsqueeze(-1).clamp_min(0.5)
 
         # Convert the features and depths into Gaussians.
         if debug:
@@ -280,8 +288,8 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 "b v r srf spp i j -> b (v r srf spp) i j",
             ),
             rearrange(
-                (context["image"] + 1.0) / 2.0,
-                "b v c h w -> b (v h w) c 1",
+                rgb_all,
+                "b v r 1 c -> b (v r) c 1",
             ),
             rearrange(
                 gaussians.opacities,

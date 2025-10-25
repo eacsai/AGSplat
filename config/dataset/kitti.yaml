@@ -3,7 +3,7 @@ defaults:
   - view_sampler: bounded
 
 name: kitti
-roots: [/data/dataset/KITTI]
+roots: [/data/dataset/wqw/KITTI]
 # file: './kitti/train_files.txt'
 file: './kitti/test1_files.txt'
 

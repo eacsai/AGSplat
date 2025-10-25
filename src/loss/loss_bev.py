@@ -115,40 +115,42 @@ class LossBev(Loss[LossBevCfg, LossBevCfgWrapper]):
         self,
         batch,
         corr,
-        g2s_feat,
-        g2s_conf,
-        sat_feat,
         meter_per_pixel,
         rotation_range=0.0,
         shift_range_lon=20.0,
         shift_range_lat=20.0,
+        weakly_supervised: bool = False,
     ) -> Float[Tensor, ""]:
         # Scale the depth between the near and far planes.
-        B, C, crop_H, crop_W = g2s_feat.shape
-
         cos = torch.cos(batch['sat']['gt_heading'][:, 0] * rotation_range / 180 * np.pi)
         sin = torch.sin(batch['sat']['gt_heading'][:, 0] * rotation_range / 180 * np.pi)
 
+        # 可视化第一章卫星图像上相机位置
         # gt_delta_x_rot正数的时候向右移动，负数的时候向左移动
         # gt_delta_y_rot正数的时候向下移动，负数的时候向上移动
-        gt_delta_x = - batch['sat']['gt_shift_u'][:, 0] * shift_range_lon
-        gt_delta_y = - batch['sat']['gt_shift_v'][:, 0] * shift_range_lat
+        gt_delta_x = batch['sat']['gt_shift_u'][:,0] * shift_range_lon
+        gt_delta_y = batch['sat']['gt_shift_v'][:,0] * shift_range_lat
+
+        corr_H, corr_W = corr.shape[-2:]
+        B = corr.shape[0]
+        if weakly_supervised:
+            max_index = torch.argmin(corr[0,0].reshape(-1)).data.cpu().numpy()
+        else:
+            max_index = torch.argmin(corr[0].reshape(-1)).data.cpu().numpy()
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * meter_per_pixel
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * meter_per_pixel
 
         # 添加可视化功能
         if self.cfg.enable_visualization:
             # 获取卫星图像（假设batch中有sat_img或可以从sat_feat转换）
-            if 'sat' in batch:
-                sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
-            else:
-                # 如果没有直接提供卫星图像，使用特征图的第一通道
-                sat_img = sat_feat[0:1, :, :]  # 取第一个特征通道
+            sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
 
             # 使用初始化时设置的meter_per_pixel值
 
             # 准备相机位置列表
             camera_positions = []
             camera_positions.append([gt_delta_x[0].item(), gt_delta_y[0].item()])
-
+            camera_positions.append([pred_u.item(), pred_v.item()])
             # 调用可视化函数
             self.visualize_camera_position_on_satellite(
                 sat_img=sat_img,
@@ -158,11 +160,21 @@ class LossBev(Loss[LossBevCfg, LossBevCfgWrapper]):
                 img_name="camera_pos"
             )
 
-        M, N, H, W = corr.shape
-        assert M == N
-        dis = torch.min(corr.reshape(M, N, -1), dim=-1)[0]
-        pos = torch.diagonal(dis) # [M]  # it is also the predicted distance
-        pos_neg = pos.reshape(-1, 1) - dis
-        loss = torch.sum(torch.log(1 + torch.exp(pos_neg * 10))) / (M * (N-1))
+        # Supervised Loss Computation
+        if not weakly_supervised:
+            w = torch.round(corr_W / 2 - 0.5 + gt_delta_x / meter_per_pixel)
+            h = torch.round(corr_H / 2 - 0.5 + gt_delta_y / meter_per_pixel)
+
+            pos = corr[range(B), h.long(), w.long()]  # [B]
+            pos_neg = pos.reshape(-1, 1, 1) - corr  # [B, H, W]
+            loss = torch.sum(torch.log(1 + torch.exp(pos_neg * 10))) / (B * (corr_H * corr_W - 1))
+        else:
+            # Weakly Supervised Loss Computation
+            M, N, H, W = corr.shape
+            assert M == N
+            dis = torch.min(corr.reshape(M, N, -1), dim=-1)[0]
+            pos = torch.diagonal(dis) # [M]  # it is also the predicted distance
+            pos_neg = pos.reshape(-1, 1) - dis
+            loss = torch.sum(torch.log(1 + torch.exp(pos_neg * 10))) / (M * (N-1))
 
         return loss

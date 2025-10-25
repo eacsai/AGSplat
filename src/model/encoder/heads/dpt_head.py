@@ -90,7 +90,7 @@ class PixelwiseTaskWithDPT(nn.Module):
         self.dpt = DPTOutputAdapter_fix(**dpt_args)
         dpt_init_args = {} if dim_tokens is None else {'dim_tokens_enc': dim_tokens}
         self.dpt.init(**dpt_init_args)
-
+        self.dpt.eval()
     def forward(self, x, img_info, ray_embedding=None):
         out = self.dpt(x, image_size=(img_info[0], img_info[1]), ray_embedding=ray_embedding)
         if self.postprocess:

@@ -10,19 +10,16 @@ import torchvision.transforms as tf
 import torchvision.transforms.functional as TF
 from einops import rearrange, repeat
 from jaxtyping import Float, UInt8
-from PIL import Image
+from PIL import Image, ImageOps
 from torch import Tensor
 from torch.utils.data import IterableDataset
 from torchvision import transforms
 import torch.nn.functional as F
 
-from ..geometry.projection import get_fov
 from .dataset import DatasetCfgCommon
-from .shims.augmentation_shim import apply_augmentation_shim
 from .shims.crop_shim import apply_crop_shim
 from .types import Stage
 from .view_sampler import ViewSampler
-from ..misc.cam_utils import camera_normalization
 import numpy as np
 import os
 
@@ -30,7 +27,7 @@ import os
 ROOT_DIR   = '/data/zhongyao/aer-grd-map'   
 GrdOriImg_H = 1080
 GrdOriImg_W = 1920
-GrdImg_H, GrdImg_W = 512, 1024             # 地面/航拍图 resize 后尺寸，原始数据：1080*1920
+GrdImg_H, GrdImg_W = 256, 512             # 地面/航拍图 resize 后尺寸，原始数据：1080*1920
 SatMap_SIDE = 1024                        # 卫星图输出边长，原始数据：2700*2700
 # --------------------------------
 satmap_dir = 'satmap'
@@ -95,15 +92,15 @@ class DatasetAerGrdDrone(IterableDataset):
         self.to_tensor = tf.ToTensor()        
         self.pro_grdimage_dir = 'depth_data'
         if self.stage in ("train"):
-            with open('/data/zhongyao/aer-grd-map/train_files.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/train_files_1024.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
         else:
-            with open('/data/zhongyao/aer-grd-map/test_files.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/test_files_1024.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
-        self.final_h = self.cfg.input_image_shape[0] * 4   # 1024
-        self.final_w = self.cfg.input_image_shape[1] * 4   # 1024
+        self.final_h = GrdImg_W   # 1024
+        self.final_w = GrdImg_W   # 1024
         self.rotation_range = 0
         self.padding_top = (self.final_h - GrdImg_H) // 2
         self.padding_left = (self.final_w - GrdImg_W) // 2
@@ -112,12 +109,17 @@ class DatasetAerGrdDrone(IterableDataset):
             transforms.Pad(padding=(self.padding_left, self.padding_top, self.padding_left, self.padding_top), fill=0),
             transforms.ToTensor(),
         ])
+        self.mask_transform = transforms.Compose([
+            transforms.Resize(size=[GrdImg_H, GrdImg_W]),
+            transforms.Pad(padding=(self.padding_left, self.padding_top, self.padding_left, self.padding_top), fill=1),
+            transforms.ToTensor(),
+        ])
         self.satmap_transform = transforms.Compose([
             transforms.Resize(size=[SatMap_process_sidelength, SatMap_process_sidelength]),
             transforms.ToTensor(),
         ])
 
-        self.meter_per_pixel = 0.2    # zoom=20；150 m / 2700 px
+        self.meter_per_pixel = 0.32307    # zoom=18；210 m / 650 px
         # self.grdimage_transform = transforms.Compose([
         #     transforms.Resize(size=[256, 1024]),
         #     transforms.ToTensor(),
@@ -157,21 +159,23 @@ class DatasetAerGrdDrone(IterableDataset):
 
             if self.stage in ("train"):
                 test_line = line.split(' ')
-                grd_path, drone_path, sat_path = test_line[0], test_line[1], test_line[2]
+                grd_path, drone_path, sat_path, grd_mask_path, drone_mask_path = test_line[0], test_line[1], test_line[2], test_line[3], test_line[4]
                 gt_shift_x = np.random.uniform(-1, 1)  # --> right as positive, parallel to the heading direction
                 gt_shift_y = np.random.uniform(-1, 1)  # --> up as positive, vertical to the heading direction
                 theta = np.random.uniform(-1, 1)
             else:
                 test_line = line.split(' ')
-                grd_path, drone_path, sat_path, gt_shift_x, gt_shift_y, theta = test_line[0], test_line[1], test_line[2], float(test_line[3]), float(test_line[4]), float(test_line[5])
+                grd_path, drone_path, sat_path, grd_mask_path, drone_mask_path, gt_shift_x, gt_shift_y, theta = test_line[0], test_line[1], test_line[2], test_line[3], test_line[4], float(test_line[5]), float(test_line[6]), float(test_line[7])
 
             # 1. 读取图像
             grd_left_feat = Image.open(grd_path).convert('RGB')
             drone_left_feat = Image.open(drone_path).convert('RGB')
             sat_img = Image.open(sat_path).convert('RGB')
+            grd_mask = Image.open(grd_mask_path).convert('L')
+            drone_mask = Image.open(drone_mask_path).convert('L')
 
             # 对卫星图进行4倍下采样
-            new_size = (750, 750)
+            new_size = (650, 650)
             sat_img = sat_img.resize(new_size, Image.BILINEAR)
 
             # 2. 内参与位姿
@@ -224,22 +228,23 @@ class DatasetAerGrdDrone(IterableDataset):
             if self.grdimage_transform is not None:
                 grd_left_feat = self.grdimage_transform(grd_left_feat).unsqueeze(0)
                 drone_left_feat = self.grdimage_transform(drone_left_feat).unsqueeze(0)
+                grd_mask = ~self.mask_transform(grd_mask).unsqueeze(0).bool()
+                drone_mask = ~self.mask_transform(drone_mask).unsqueeze(0).bool()
 
             extrinsics = torch.eye(4, dtype=torch.float32)
             # 添加 batch 维度以适应 F.interpolate，然后移除
 
             grd_img = F.interpolate(grd_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
             drone_img = F.interpolate(drone_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
-            
-            grd_mask = rearrange(grd_img, 'v c h w -> v h w c').any(dim=-1).float()
-            drone_mask = rearrange(drone_img, 'v c h w -> v h w c').any(dim=-1).float()
+            grd_mask = F.interpolate(grd_mask.float(), size=self.cfg.input_image_shape, mode='bilinear', align_corners=False).squeeze(1)
+            drone_mask = F.interpolate(drone_mask.float(), size=self.cfg.input_image_shape, mode='bilinear', align_corners=False).squeeze(1)
 
             example = {
                 "context": {
                     "extrinsics": torch.stack((cam2world, cam2world), dim=0),
                     "intrinsics": torch.stack((left_camera_k, left_camera_k), dim=0),
-                    "image": torch.cat((grd_img, grd_img), dim=0),
-                    "mask": torch.cat((grd_mask, grd_mask), dim=0),
+                    "image": torch.cat((grd_img, drone_img), dim=0),
+                    "mask": torch.cat((grd_mask, drone_mask), dim=0),
                     "feat_image": torch.cat((grd_left_feat, grd_left_feat), dim=0),
                     "near": self.get_bound("near", 1),
                     "far": self.get_bound("far", 1),
@@ -262,6 +267,8 @@ class DatasetAerGrdDrone(IterableDataset):
                     "gt_shift_u": torch.tensor([-gt_shift_x], dtype=torch.float32),
                     "gt_shift_v": torch.tensor([gt_shift_y], dtype=torch.float32),
                     "gt_heading": torch.tensor([heading], dtype=torch.float32),
+                    "gt_loc": torch.tensor([[-dy_p, dx_p]], dtype=torch.float32),
+                    "gt_r": torch.zeros((2,2), dtype=torch.float32)
                 },
                 "scene": 'kitti',
             }

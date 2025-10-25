@@ -17,7 +17,7 @@ mode: train
 data_loader:
   # Avoid having to spin up new processes to print out visualizations.
   train:
-    num_workers: 16
+    num_workers: 32
     persistent_workers: true
     batch_size: 8
     seed: 1234
@@ -50,6 +50,7 @@ train:
   distiller: ''
   distill_max_steps: 1000000
   meter_per_pixel: 0.19582850865299833
+  weakly_supervised: false
 
 test:
   output_path: ./outputs/test
@@ -71,7 +72,7 @@ trainer:
   check_val_every_n_epoch: 1
   max_epochs: 10
   enable_progress_bar: true
-  num_sanity_val_steps: 0
+  num_sanity_val_steps: 6
 
 hydra:
   run:

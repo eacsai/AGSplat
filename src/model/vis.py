@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 import torchvision.transforms as transforms
 to_pil_image = transforms.ToPILImage()
 
-def vis_bev(batch, gaussians, output):
+def vis_bev(batch, gaussians):
     b,v,c,h,w = batch["context"]["image"].shape
-    point_color = (rearrange(batch["context"]["image"], 'b v c h w -> b (v h w) c') + 1) / 2
+    point_color = gaussians.harmonics.squeeze()
     point_clouds = gaussians.means
     grd2sat_direct_color = forward_project(
         point_color,
@@ -60,11 +60,43 @@ def vis_bev(batch, gaussians, output):
 
     rgb_input = (batch['context']["image"][0,0] + 1) / 2
     test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
-    test_img.save('input.png')
+    test_img.save('input1.png')
 
-    rgb_output = output.color[0,0]
-    test_img = to_pil_image(rgb_output.clamp(min=0,max=1))
-    test_img.save('output.png')
+    rgb_input = (batch['context']["image"][0,1] + 1) / 2
+    test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
+    test_img.save('input2.png')
+
+    mask_input = batch['context']["mask"][0,0] # [h,w]
+    test_img = to_pil_image(mask_input.clamp(min=0,max=1))
+    test_img.save('mask1.png')
+
+    mask_input = batch['context']["mask"][0,1] # [h,w]
+    test_img = to_pil_image(mask_input.clamp(min=0,max=1))
+    test_img.save('mask2.png')
+
+    sat_img = F.interpolate(batch['sat']['sat_align'], size=(512, 512), mode='bilinear', align_corners=False)
+    test_img = to_pil_image(sat_img[0])
+
+    # 获取图像的宽度和高度
+    width, height = test_img.size
+
+    # 计算中心点的坐标
+    center_x = width // 2
+    center_y = height // 2
+
+    # 创建一个可以在图像上绘图的对象
+    draw = ImageDraw.Draw(test_img)
+
+    # 定义红点的半径（可以根据需要调整）
+    radius = 5
+
+    # 绘制一个红色圆形作为中心点
+    # draw.ellipse((x1, y1, x2, y2), fill=color, outline=color)
+    # x1, y1 是左上角坐标，x2, y2 是右下角坐标
+    draw.ellipse((center_x - radius, center_y - radius,
+                center_x + radius, center_y + radius),
+                fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
+    test_img.save('sat_align.png')
 
     sat_img = F.interpolate(batch['sat']['sat'], size=(512, 512), mode='bilinear', align_corners=False)
     test_img = to_pil_image(sat_img[0])

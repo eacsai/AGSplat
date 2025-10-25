@@ -7,7 +7,7 @@ defaults:
   - override /loss: [bev]
 
 wandb:
-  name: aer_grd_drone
+  name: aer_grd_drone_weakly_supervised
   tags: [aer_grd_drone, 256x256]
 
 model:
@@ -27,18 +27,19 @@ dataset:
       warm_up_steps: 9375
 
 optimizer:
-  lr: 6.25e-5
+  lr: 1e-4
   warm_up_steps: 500
   backbone_lr_multiplier: 0.1
 
 data_loader:
   train:
-    batch_size: 2
+    batch_size: 16
 
 trainer:
   max_epochs: 10
   val_check_interval: 1.0
-  max_steps: 20000 # 确保训练不会因为步数限制而过早停止
+  max_steps: 28000 # 确保训练不会因为步数限制而过早停止
 
 train:
-  meter_per_pixel: 0.2
+  weakly_supervised: true
+  meter_per_pixel: 0.32307

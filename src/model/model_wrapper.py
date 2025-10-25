@@ -90,6 +90,7 @@ class TrainCfg:
     distiller: str
     distill_max_steps: int
     meter_per_pixel: float
+    weakly_supervised: bool
 
 
 @runtime_checkable
@@ -143,7 +144,7 @@ class ModelWrapper(LightningModule):
         self.dino_feat.eval()
         self.dpt = DPT(self.dino_feat.feat_dim)
 
-        self.meters_per_pixel = train_cfg.meter_per_pixel * 4  # downsampled by 4
+        self.meter_per_pixel = train_cfg.meter_per_pixel  # downsampled by 4
         self.distiller = distiller
         self.distiller_loss = None
         if self.distiller is not None:
@@ -199,12 +200,18 @@ class ModelWrapper(LightningModule):
         sat_feat, sat_conf = self.dpt(sat_feats)
         grd_feat, grd_conf = self.dpt(grd_feats)
         A = sat_feat.shape[-1]
+        meter_per_pixel = self.meter_per_pixel * 512 / A
         # Run the model.
         visualization_dump = None
         if self.distiller is not None:
             visualization_dump = {}
         
-        gaussians = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+        gaussians = self.encoder(
+            grd_feat.shape[-2:], 
+            batch["context"], 
+            self.global_step, 
+            visualization_dump=visualization_dump
+        )
         
         gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
         gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
@@ -213,68 +220,55 @@ class ModelWrapper(LightningModule):
         heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
         grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
             gaussians, 
-            (A, A),
+            (A // 2, A // 2),
             heading=heading, 
-            width=100.0, 
-            height=100.0
+            width=A // 2 * meter_per_pixel, 
+            height=A // 2 * meter_per_pixel
         )
-        meter_per_pixel = self.meters_per_pixel
 
-        crop_H = int(A - 20 * 3 / meter_per_pixel)
-        crop_W = int(A - 20 * 3 / meter_per_pixel)
+        # Weakly Supervised Loss Computation
+        # crop_H = int(A - 20 * 3 / meter_per_pixel)
+        # crop_W = int(A - 20 * 3 / meter_per_pixel)
+        crop_H = int(A // 2)
+        crop_W = int(A // 2)
         g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_feat = F.normalize(g2s_feat.reshape(b, -1)).reshape(b, -1, crop_H, crop_W)
         g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
         # grd2sat_color = TF.center_crop(grd2sat_color, [crop_H, crop_W])
         rgb_bev = grd2sat_color[0]
+        rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
         test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
         test_img.save('splat_bev.png')
 
-        # vis_bev(batch, gaussians, output)
+        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
+        test_img.save('sat_bev.png')
+
+        # vis_bev(batch, gaussians)
         # single_features_to_RGB_colormap(grd2sat_feature, idx=0, img_name='bev_feature.png', cmap_name='rainbow')
-        signal = sat_feat.repeat(1, b, 1, 1)  # [B(M), BC(NC), H, W]
-        kernel = g2s_feat * g2s_conf.pow(2)
-        corr = F.conv2d(signal, kernel, groups=b)
+        if self.train_cfg.weakly_supervised:
+            corr = self.weakly_corr(sat_feat, g2s_feat, g2s_conf)
+        else:
+            corr = self.supervise_corr(sat_feat, g2s_feat, g2s_conf)
 
-        denominator_sat = []
-        sat_feat_pow = (sat_feat).pow(2)
-        g2s_conf_pow = g2s_conf.pow(2)
-        for i in range(0, b):
-            denom_sat = torch.sum(F.conv2d(sat_feat_pow[i, :, None, :, :], g2s_conf_pow), dim=0)
-            denominator_sat.append(denom_sat)
-        denominator_sat = torch.sqrt(torch.stack(denominator_sat, dim=0))  # [B (M), B (N), H, W]
-
-        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1) # [B]
-        shape = denominator_sat.shape
-        denominator_grd = denom_grd[None, :, None, None].repeat(shape[0], 1, shape[2], shape[3])
-
-        denominator = denominator_sat * denominator_grd
-        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
-        corr = 2 - 2 * corr / denominator  # [B, B, H, W]
-
-        corr_H, corr_W = corr.shape[2:]
-        max_index = torch.argmin(corr[0, 0].reshape(-1)).data.cpu().numpy()
-        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel
-        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel
-
-        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位：（m）
-        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位：（m）
-
-        self.visualize_positions_on_satellite(
-            gaussians, batch, pred_u, pred_v,
-            gt_shift_u[0].cpu().detach().numpy(),
-            gt_shift_v[0].cpu().detach().numpy()
-        )
+        # self.visualize_positions_on_satellite(
+        #     corr, gaussians, batch
+        # )
 
         # Compute and log loss.
         total_loss = 0
         for loss_fn in self.losses:
+            # loss = loss_fn.forward(
+            #     batch,
+            #     sat_feat,
+            #     g2s_feat,
+            #     self.meter_per_pixel,
+            #     weakly_supervised=self.train_cfg.weakly_supervised,
+            # )
             loss = loss_fn.forward(
                 batch,
                 corr,
-                g2s_feat, 
-                g2s_conf, 
-                sat_feat,
                 meter_per_pixel,
+                weakly_supervised=self.train_cfg.weakly_supervised,
             )
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
@@ -396,162 +390,178 @@ class ModelWrapper(LightningModule):
 
         # Visualize positions on satellite image
         self.visualize_positions_on_satellite(
-            gaussians, batch, pred_u[0], pred_v[0],
-            gt_shift_u[0].cpu().detach().numpy(),
-            gt_shift_v[0].cpu().detach().numpy()
+            corr, gaussians, batch
         )
 
-    def visualize_positions_on_satellite(self, gaussians, batch, pred_u, pred_v, gt_shift_u, gt_shift_v):
+    def visualize_positions_on_satellite(self, corr, gaussians, batch, meter_per_pixel):
         """
         在卫星图上可视化预测位置和真实位置
 
         Args:
             gaussians: 高斯球的参数
             batch: 包含卫星图像的batch
-            pred_u: 预测的u坐标（米）
-            pred_v: 预测的v坐标（米）
-            gt_shift_u: 真实的u坐标（米）
-            gt_shift_v: 真实的v坐标（米）
         """
         # write_ply(gaussians.means[0].cpu().detach().numpy(), gaussians.harmonics[0,:,:,0].cpu().detach().numpy())
 
-        try:
-            # 获取卫星图像
-            sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
+        corr_H, corr_W = corr.shape[-2:]
+        max_index = torch.argmax(corr[0].reshape(-1)).data.cpu().numpy()
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * meter_per_pixel
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * meter_per_pixel
 
-            # 处理图像格式
-            if isinstance(sat_img, torch.Tensor):
-                sat_img_np = sat_img.detach().cpu().numpy()
-                # 如果是CHW格式，转换为HWC
-                if sat_img_np.shape[0] < sat_img_np.shape[2]:
-                    sat_img_np = np.transpose(sat_img_np, (1, 2, 0))
-            else:
-                sat_img_np = sat_img
+        gt_shift_u = batch['sat']['gt_shift_u'][0, 0] * 20.0 # 单位：（m）
+        gt_shift_v = batch['sat']['gt_shift_v'][0, 0] * 20.0 # 单位：（m）
 
-            # 归一化到0-255范围
-            if sat_img_np.max() <= 1.0:
-                sat_img_np = (sat_img_np * 255).astype(np.uint8)
-            else:
-                sat_img_np = sat_img_np.astype(np.uint8)
+        # 获取卫星图像
+        sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
 
-            # 转换为BGR格式（OpenCV格式）
-            if sat_img_np.shape[2] == 3:
-                vis_img = cv2.cvtColor(sat_img_np, cv2.COLOR_RGB2BGR)
-            else:
-                vis_img = sat_img_np.copy()
+        # 处理图像格式
+        if isinstance(sat_img, torch.Tensor):
+            sat_img_np = sat_img.detach().cpu().numpy()
+            # 如果是CHW格式，转换为HWC
+            if sat_img_np.shape[0] < sat_img_np.shape[2]:
+                sat_img_np = np.transpose(sat_img_np, (1, 2, 0))
+        else:
+            sat_img_np = sat_img
 
-            H, W = vis_img.shape[:2]
-            center_x, center_y = W // 2, H // 2
+        # 归一化到0-255范围
+        if sat_img_np.max() <= 1.0:
+            sat_img_np = (sat_img_np * 255).astype(np.uint8)
+        else:
+            sat_img_np = sat_img_np.astype(np.uint8)
 
-            # 米每像素的比例
-            meter_per_pixel = self.meters_per_pixel / 4
+        # 转换为BGR格式（OpenCV格式）
+        if sat_img_np.shape[2] == 3:
+            vis_img = cv2.cvtColor(sat_img_np, cv2.COLOR_RGB2BGR)
+        else:
+            vis_img = sat_img_np.copy()
 
-            # 绘制预测位置（红色三角形）
-            if isinstance(pred_u, torch.Tensor):
-                pred_x = float(pred_u.cpu().detach().numpy())
-            else:
-                pred_x = float(pred_u)
+        H, W = vis_img.shape[:2]
+        center_x, center_y = W // 2, H // 2
 
-            if isinstance(pred_v, torch.Tensor):
-                pred_y = float(pred_v.cpu().detach().numpy())
-            else:
-                pred_y = float(pred_v)
-            pixel_x_pred = int(center_x + pred_x / meter_per_pixel)
-            pixel_y_pred = int(center_y + pred_y / meter_per_pixel)
+        # 绘制预测位置（红色三角形）
+        if isinstance(pred_u, torch.Tensor):
+            pred_x = float(pred_u.cpu().detach().numpy())
+        else:
+            pred_x = float(pred_u)
 
-            triangle_size = 15
-            pred_triangle = np.array([
-                [pixel_x_pred, pixel_y_pred - triangle_size],
-                [pixel_x_pred - triangle_size//2, pixel_y_pred + triangle_size//2],
-                [pixel_x_pred + triangle_size//2, pixel_y_pred + triangle_size//2]
-            ], dtype=np.int32)
+        if isinstance(pred_v, torch.Tensor):
+            pred_y = float(pred_v.cpu().detach().numpy())
+        else:
+            pred_y = float(pred_v)
+        pixel_x_pred = int(center_x + pred_x / self.meter_per_pixel)
+        pixel_y_pred = int(center_y + pred_y / self.meter_per_pixel)
 
-            cv2.fillPoly(vis_img, [pred_triangle], (0, 0, 255))  # 红色填充
-            cv2.polylines(vis_img, [pred_triangle], True, (255, 255, 255), 2)  # 白色边框
+        triangle_size = 15
+        pred_triangle = np.array([
+            [pixel_x_pred, pixel_y_pred - triangle_size],
+            [pixel_x_pred - triangle_size//2, pixel_y_pred + triangle_size//2],
+            [pixel_x_pred + triangle_size//2, pixel_y_pred + triangle_size//2]
+        ], dtype=np.int32)
 
-            # 绘制真实位置（绿色三角形）
-            gt_x = float(gt_shift_u)
-            gt_y = float(gt_shift_v)
+        cv2.fillPoly(vis_img, [pred_triangle], (0, 0, 255))  # 红色填充
+        cv2.polylines(vis_img, [pred_triangle], True, (255, 255, 255), 2)  # 白色边框
 
-            pixel_x_gt = int(center_x + gt_x / meter_per_pixel)
-            pixel_y_gt = int(center_y + gt_y / meter_per_pixel)
+        # 绘制真实位置（绿色三角形）
+        gt_x = float(gt_shift_u)
+        gt_y = float(gt_shift_v)
 
-            gt_triangle = np.array([
-                [pixel_x_gt, pixel_y_gt - triangle_size],
-                [pixel_x_gt - triangle_size//2, pixel_y_gt + triangle_size//2],
-                [pixel_x_gt + triangle_size//2, pixel_y_gt + triangle_size//2]
-            ], dtype=np.int32)
+        pixel_x_gt = int(center_x + gt_x / self.meter_per_pixel)
+        pixel_y_gt = int(center_y + gt_y / self.meter_per_pixel)
 
-            cv2.fillPoly(vis_img, [gt_triangle], (0, 255, 0))  # 绿色填充
-            cv2.polylines(vis_img, [gt_triangle], True, (255, 255, 255), 2)  # 白色边框
+        gt_triangle = np.array([
+            [pixel_x_gt, pixel_y_gt - triangle_size],
+            [pixel_x_gt - triangle_size//2, pixel_y_gt + triangle_size//2],
+            [pixel_x_gt + triangle_size//2, pixel_y_gt + triangle_size//2]
+        ], dtype=np.int32)
 
-            # 添加图例
-            legend_y = 30
-            cv2.rectangle(vis_img, (10, legend_y-20), (250, legend_y+40), (0, 0, 0), -1)  # 黑色背景
-            cv2.putText(vis_img, "Position Visualization", (15, legend_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.fillPoly(vis_img, [np.array([[25, legend_y+5], [35, legend_y-5], [45, legend_y+5]])], (0, 0, 255))
-            cv2.putText(vis_img, "Predicted", (55, legend_y+5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            cv2.fillPoly(vis_img, [np.array([[25, legend_y+20], [35, legend_y+10], [45, legend_y+20]])], (0, 255, 0))
-            cv2.putText(vis_img, "Ground Truth", (55, legend_y+20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.fillPoly(vis_img, [gt_triangle], (0, 255, 0))  # 绿色填充
+        cv2.polylines(vis_img, [gt_triangle], True, (255, 255, 255), 2)  # 白色边框
 
-            # 创建保存目录
-            save_dir = "./camera_position_visualization"
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, "camera_pos.png")
+        # 添加图例
+        legend_y = 30
+        cv2.rectangle(vis_img, (10, legend_y-20), (250, legend_y+40), (0, 0, 0), -1)  # 黑色背景
+        cv2.putText(vis_img, "Position Visualization", (15, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.fillPoly(vis_img, [np.array([[25, legend_y+5], [35, legend_y-5], [45, legend_y+5]])], (0, 0, 255))
+        cv2.putText(vis_img, "Predicted", (55, legend_y+5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.fillPoly(vis_img, [np.array([[25, legend_y+20], [35, legend_y+10], [45, legend_y+20]])], (0, 255, 0))
+        cv2.putText(vis_img, "Ground Truth", (55, legend_y+20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-            # 保存图像
-            cv2.imwrite(save_path, vis_img)
+        # 创建保存目录
+        save_dir = "./camera_position_visualization"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, "camera_pos.png")
 
-            ###### 保存原始卫星图 ######
-            # 定义红点的半径（可以根据需要调整）
-            radius = 5
-            sat_img = F.interpolate(batch['sat']['sat_align'], size=(H, W), mode='bilinear', align_corners=False)
-            test_img = to_pil_image(sat_img[0])
-            # 创建一个可以在图像上绘图的对象
-            draw = ImageDraw.Draw(test_img)
+        # 保存图像
+        cv2.imwrite(save_path, vis_img)
 
-            # 绘制一个红色圆形作为中心点
-            # draw.ellipse((x1, y1, x2, y2), fill=color, outline=color)
-            # x1, y1 是左上角坐标，x2, y2 是右下角坐标
-            draw.ellipse((center_x - radius, center_y - radius,
-                        center_x + radius, center_y + radius),
-                        fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
-            test_img.save(os.path.join(save_dir, 'sat.png'))
+        ###### 保存原始卫星图 ######
+        # 定义红点的半径（可以根据需要调整）
+        radius = 5
+        sat_img = F.interpolate(batch['sat']['sat_align'], size=(H, W), mode='bilinear', align_corners=False)
+        test_img = to_pil_image(sat_img[0])
+        # 创建一个可以在图像上绘图的对象
+        draw = ImageDraw.Draw(test_img)
 
-            ###### 保存输入地面图 ######
-            rgb_input = (batch['context']["image"][0,0] + 1) / 2
-            test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
-            test_img.save(os.path.join(save_dir, 'input1.png'))
-            rgb_input = (batch['context']["image"][0,1] + 1) / 2
-            test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
-            test_img.save(os.path.join(save_dir, 'input2.png'))
-            ###### 保存Bev投影地面图 ######
-            point_color = (rearrange(batch["context"]["image"], 'b v c h w -> b (v h w) c') + 1) / 2
-            point_clouds = gaussians.means
-            grd2sat_direct_color = forward_project(
-                point_color,
-                point_clouds,
-                meter_per_pixel=0.2
-            )
-            rgb_bev = grd2sat_direct_color[0]
-            test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+        # 绘制一个红色圆形作为中心点
+        # draw.ellipse((x1, y1, x2, y2), fill=color, outline=color)
+        # x1, y1 是左上角坐标，x2, y2 是右下角坐标
+        draw.ellipse((center_x - radius, center_y - radius,
+                    center_x + radius, center_y + radius),
+                    fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
+        test_img.save(os.path.join(save_dir, 'sat.png'))
 
-            # 创建一个可以在图像上绘图的对象
-            draw = ImageDraw.Draw(test_img)
-            # 绘制一个红色圆形作为中心点
-            # draw.ellipse((x1, y1, x2, y2), fill=color, outline=color)
-            # x1, y1 是左上角坐标，x2, y2 是右下角坐标
-            draw.ellipse((center_x - radius, center_y - radius,
-                        center_x + radius, center_y + radius),
-                        fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
-            # 保存图片
-            test_img.save(os.path.join(save_dir, 'direct_bev.png'))
+        ###### 保存输入地面图 ######
+        rgb_input = (batch['context']["image"][0,0] + 1) / 2
+        test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
+        test_img.save(os.path.join(save_dir, 'input1.png'))
+        rgb_input = (batch['context']["image"][0,1] + 1) / 2
+        test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
+        test_img.save(os.path.join(save_dir, 'input2.png'))
 
-        except Exception as e:
-            print(f"Error in position visualization: {e}")
+    def weakly_corr(self, sat_feat, g2s_feat, g2s_conf):
+        # 这里实现弱监督相关性计算
+        b = sat_feat.shape[0]
+        signal = sat_feat.repeat(1, b, 1, 1)  #[B(M), BC(NC), H, W]
+        kernel = g2s_feat * g2s_conf.pow(2)
+        corr = F.conv2d(signal, kernel, groups=b)
+        denominator_sat = []
+        sat_feat_pow = (sat_feat).pow(2)
+        g2s_conf_pow = g2s_conf.pow(2)
+        for i in range(0, b):
+            denom_sat = torch.sum(F.conv2d(sat_feat_pow[i, :, None, :, :], g2s_conf_pow), dim=0)
+            denominator_sat.append(denom_sat)
+        denominator_sat = torch.sqrt(torch.stack(denominator_sat, dim=0))  #[B (M), B (N), H, W]
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1) # [B]
+        shape = denominator_sat.shape
+        denominator_grd = denom_grd[None, :, None, None].repeat(shape[0], 1, shape[2], shape[3])
+        denominator = denominator_sat * denominator_grd
+        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
+        corr = 2 - 2 * corr / denominator  #[B, B, H, W]
+        return corr
+
+    def supervise_corr(self, sat_feat, g2s_feat, g2s_conf):
+        # 这里实现弱监督相关性计算
+        b, c, crop_H, crop_W = g2s_feat.shape
+        A = sat_feat.shape[-1]
+        s_feat = sat_feat.reshape(1, -1, A, A)  # [B, C, H, W]->[1, B*C, H, W]
+        g2s_conf_pow = g2s_conf.pow(2)
+
+        corr = F.conv2d(s_feat, g2s_feat * g2s_conf_pow, groups=b)[0] # [B, H, W]
+
+        sat_feat_pow = sat_feat.pow(2)  # [B, C, H, W]
+        denominator_sat = torch.sum(F.conv2d(sat_feat_pow.transpose(0,1), g2s_conf_pow, groups=b), dim=0)  # [B, H, W]
+        # denominator_sat = torch.sum(sat_feat_pow, dim=1)  # [B, H, W]
+        denominator_sat = torch.maximum(torch.sqrt(denominator_sat), torch.ones_like(denominator_sat) * 1e-6)
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1)  # [B]
+        shape = denominator_sat.shape
+        denominator_grd = denom_grd[:, None, None].repeat(1, shape[1], shape[2])
+        denominator = denominator_sat * denominator_grd # [B, H, W]
+        corr = 2 - 2 * corr / denominator
+        return corr
+
 
     def on_test_end(self) -> None:
         name = get_cfg()["wandb"]["name"]
@@ -808,49 +818,39 @@ class ModelWrapper(LightningModule):
         sat_feat, sat_conf = self.dpt(sat_feats)
         grd_feat, grd_conf = self.dpt(grd_feats)
         A = sat_feat.shape[-1]
-
+        meter_per_pixel = self.meter_per_pixel * 512 / A
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
             gaussians = self.encoder(
-                batch["context"],
-                self.global_step,
+                grd_feat.shape[-2:], 
+                batch["context"], 
+                self.global_step, 
             )
 
         gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
         gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
 
-        # align the target pose
-        if self.test_cfg.align_pose:
-            output = self.test_step_align(batch, gaussians)
-        else:
-            with self.benchmarker.time("decoder", num_calls=v):
-                output = self.decoder.forward(
-                    gaussians,
-                    batch["target"]["extrinsics"],
-                    batch["target"]["intrinsics"],
-                    batch["target"]["near"],
-                    batch["target"]["far"],
-                    (h, w),
-                )
-
         # get gaussian bev
         heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
         grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
             gaussians, 
-            (A, A),
+            (A // 2, A // 2),
             heading=heading, 
-            width=100.0, 
-            height=100.0
+            width=A // 2 * meter_per_pixel, 
+            height=A // 2 * meter_per_pixel
         )
-        crop_H = int(A - 20 * 3 / self.meters_per_pixel)
-        crop_W = int(A - 20 * 3 / self.meters_per_pixel)
+        crop_H = int(A // 2)
+        crop_W = int(A // 2)
         g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_feat = F.normalize(g2s_feat.reshape(b, -1)).reshape(b, -1, crop_H, crop_W)
         g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
 
         rgb_bev = grd2sat_color[0]
-        test_img = to_pil_image(rgb_bev)
+        rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
+        test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
         test_img.save('splat_bev.png')
-
+        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
+        test_img.save('sat_bev.png')
         ### compute correlation
         signal = sat_feat.reshape(1, -1, A, A)
         kernel = g2s_feat * g2s_conf.pow(2)
@@ -867,15 +867,15 @@ class ModelWrapper(LightningModule):
         denominator = denominator_sat * denominator_grd
         denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
         corr = corr / denominator  # [B, H, W]
-        corr_H = int(20.0 * 3 / self.meters_per_pixel)
-        corr_W = int(20.0 * 3 / self.meters_per_pixel)
+        corr_H = int(20.0 * 3 / meter_per_pixel)
+        corr_W = int(20.0 * 3 / meter_per_pixel)
         corr = TF.center_crop(corr[:, None], [corr_H, corr_W])[:, 0]
 
         # compute pred_u and pred_v
         max_index = torch.argmax(corr.reshape(b, -1), dim=1)
 
-        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lon
-        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lat
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lon
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lat
 
         gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位(m)
         gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位(m)
@@ -887,9 +887,7 @@ class ModelWrapper(LightningModule):
 
         # Visualize positions on satellite image
         self.visualize_positions_on_satellite(
-            gaussians, batch, pred_u[0], pred_v[0],
-            gt_shift_u[0].cpu().detach().numpy(),
-            gt_shift_v[0].cpu().detach().numpy()
+            corr, gaussians, batch, meter_per_pixel
         )
 
     def configure_optimizers(self):

@@ -1,0 +1,5 @@
+glue:
+  weight: 1.0
+  enable_visualization: True
+  temperature: 0.1
+  num_samples_matches: 1024

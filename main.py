@@ -1,6 +1,6 @@
 import os
 import warnings
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 指定使用的GPU设备ID
 
 # 设置 DDP 相关环境变量来优化性能
 os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息
@@ -137,9 +137,6 @@ def train(cfg_dict: DictConfig):
     encoder, encoder_visualizer = get_encoder(cfg.model.encoder)
 
     distiller = None
-    if cfg.train.distiller:
-        distiller = get_distiller(cfg.train.distiller)
-        distiller = distiller.eval()
 
     # Load the encoder weights.
     if cfg.model.encoder.pretrained_weights and cfg.mode == "train":

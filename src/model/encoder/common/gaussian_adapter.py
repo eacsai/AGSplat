@@ -167,7 +167,7 @@ class DebugGaussianAdapter(GaussianAdapter):
         intrinsics: Optional[Float[Tensor, "*#batch 3 3"]] = None,
         coordinates: Optional[Float[Tensor, "*#batch 2"]] = None,
         # 可以添加一个参数来控制调试时球体的大小
-        debug_scale: float = 0.002,
+        debug_scale: float = 0.02,
     ) -> Gaussians:
         
         batch_shape = means.shape[:-1]
