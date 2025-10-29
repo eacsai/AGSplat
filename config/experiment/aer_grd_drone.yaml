@@ -7,7 +7,7 @@ defaults:
   - override /loss: [bev]
 
 wandb:
-  name: aer_grd_drone_weakly_supervised
+  name: aer_grd_drone
   tags: [aer_grd_drone, 256x256]
 
 model:
@@ -41,5 +41,5 @@ trainer:
   max_steps: 28000 # 确保训练不会因为步数限制而过早停止
 
 train:
-  weakly_supervised: true
-  meter_per_pixel: 0.32307
+  weakly_supervised: false
+  meter_per_pixel: 0.41015625

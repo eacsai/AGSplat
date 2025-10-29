@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - /dataset@_group_.aer_grd_drone_pi3: aer_grd_drone_pi3
+  - override /loss: [bev]
+
+wandb:
+  name: aer_grd_drone_pi3
+  tags: [aer_grd_drone_pi3, 504x504]
+
+model:
+  encoder:
+    name: pi3
+    gaussians_per_pixel: 1
+    pose_free: true
+
+  decoder:
+    make_scale_invariant: true
+
+dataset:
+  aer_grd_drone_pi3:
+    view_sampler:
+      warm_up_steps: 9375
+
+optimizer:
+  lr: 1e-4  # 大幅降低学习率，避免梯度爆炸
+  warm_up_steps: 500
+  backbone_lr_multiplier: 0.1  # 进一步降低 backbone 学习率
+
+data_loader:
+  train:
+    batch_size: 16
+
+trainer:
+  max_epochs: 10
+  val_check_interval: 1.0
+  max_steps: 28000 # 确保训练不会因为步数限制而过早停止
+
+train:
+  weakly_supervised: false
+  meter_per_pixel: 0.41015625

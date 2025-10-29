@@ -285,11 +285,11 @@ class DPT(nn.Module):
 
         self.out_conv = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
-            nn.ReLU(True),
+            nn.LeakyReLU(),
             nn.Conv2d(hidden_dim, output_dim, 3, padding=1),
         )
         self.conf = nn.Sequential(
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(output_dim, 1, kernel_size=(3, 3), stride=(1, 1), padding=1, bias=False),
             nn.Sigmoid(),
         )

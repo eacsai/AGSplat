@@ -143,7 +143,7 @@ class LossBev(Loss[LossBevCfg, LossBevCfgWrapper]):
         # 添加可视化功能
         if self.cfg.enable_visualization:
             # 获取卫星图像（假设batch中有sat_img或可以从sat_feat转换）
-            sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
+            sat_img = batch['sat']['sat_ref'][0]  # 取第一个样本的卫星图像
 
             # 使用初始化时设置的meter_per_pixel值
 

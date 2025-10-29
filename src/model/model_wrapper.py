@@ -44,10 +44,10 @@ from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections
 from .decoder.decoder import Decoder, DepthRenderingMode
-from .decoder.cuda_splatting import render_cuda_orthographic, render_bevs, forward_project, project_point_clouds
+from .decoder.cuda_splatting import render_cuda_orthographic, render_bevs, forward_project
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
-
+from .encoder.utils import project_point_clouds
 from .ply_export import export_ply, write_ply
 from .vis import vis_bev, single_features_to_RGB_colormap
 from .dino_dpt import DINO, DPT
@@ -145,12 +145,6 @@ class ModelWrapper(LightningModule):
         self.dpt = DPT(self.dino_feat.feat_dim)
 
         self.meter_per_pixel = train_cfg.meter_per_pixel  # downsampled by 4
-        self.distiller = distiller
-        self.distiller_loss = None
-        if self.distiller is not None:
-            convert_to_buffer(self.distiller, persistent=False)
-            self.distiller_loss = Regr3D()
-
         # This is used for testing.
         self.benchmarker = Benchmarker()
 
@@ -161,29 +155,13 @@ class ModelWrapper(LightningModule):
         self.gt_lats = []
 
     def training_step(self, batch, batch_idx):
-        # combine batch from different dataloaders
-        if isinstance(batch, list):
-            batch_combined = None
-            for batch_per_dl in batch:
-                if batch_combined is None:
-                    batch_combined = batch_per_dl
-                else:
-                    for k in batch_combined.keys():
-                        if isinstance(batch_combined[k], list):
-                            batch_combined[k] += batch_per_dl[k]
-                        elif isinstance(batch_combined[k], dict):
-                            for kk in batch_combined[k].keys():
-                                batch_combined[k][kk] = torch.cat([batch_combined[k][kk], batch_per_dl[k][kk]], dim=0)
-                        else:
-                            raise NotImplementedError
-            batch = batch_combined
         batch: BatchedExample = self.data_shim(batch)
         # Render Gaussians.
         feat_img = batch["context"]["feat_image"]
         grd_img = batch["context"]["image"]
         b, v, _, h, w = grd_img.shape
         feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
-        sat_img = batch["sat"]["sat"]
+        sat_img = batch["sat"]["sat_ref"]
 
         # extract grd and sat feature
         with torch.no_grad():
@@ -195,54 +173,92 @@ class ModelWrapper(LightningModule):
             if isinstance(grd_feat, (tuple, list)):
                 grd_feats = [_f.detach() for _f in grd_feat]
         
-        # TODO: use two dpt and upsample grd_feat
-        # dpt
         sat_feat, sat_conf = self.dpt(sat_feats)
         grd_feat, grd_conf = self.dpt(grd_feats)
         A = sat_feat.shape[-1]
         meter_per_pixel = self.meter_per_pixel * 512 / A
-        # Run the model.
-        visualization_dump = None
-        if self.distiller is not None:
-            visualization_dump = {}
         
-        gaussians = self.encoder(
+        gaussians, grd_camera = self.encoder(
             grd_feat.shape[-2:], 
-            batch["context"], 
-            self.global_step, 
-            visualization_dump=visualization_dump
+            batch, 
+            self.global_step,
         )
         
         gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
         gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
         
         # get gaussian bev
-        heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
-        grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
-            gaussians, 
-            (A // 2, A // 2),
-            heading=heading, 
-            width=A // 2 * meter_per_pixel, 
-            height=A // 2 * meter_per_pixel
-        )
+        if grd_camera is not None:
+            # intrinsics = grd_camera.intrinsics
+            # extrinsics = grd_camera.extrinsics
+            # output = self.decoder.forward(
+            #     gaussians,
+            #     extrinsics,
+            #     intrinsics,
+            #     batch["target"]["near"],
+            #     batch["target"]["far"],
+            #     (int(A * 2 / 3), int(A * 2 / 3)),
+            #     use_sh=False,
+            # )
+            # grd2sat_color = output.color.squeeze(1)
+            # grd2sat_feature = output.feature.squeeze(1)
+            # grd2sat_confidence = output.confidence.squeeze(1)
+            grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs(
+                gaussians,
+                (int(A * 2 / 3), int(A * 2 / 3)),
+                look_axis=2,
+                width=grd_camera.width,
+                height=grd_camera.height
+            )
+        else:
+            heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
+            grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs(
+                gaussians,
+                (A, A),
+                heading=heading, 
+                width=torch.tensor([A * meter_per_pixel] * b, dtype=torch.float32, device=batch["target"]["extrinsics"].device), 
+                height=torch.tensor([A * meter_per_pixel] * b, dtype=torch.float32, device=batch["target"]["extrinsics"].device)
+            )
 
+        # grd2sat_color = project_point_clouds(
+        #     gaussians.means,
+        #     gaussians.harmonics.squeeze(-1),
+        #     grd_camera.intrinsics.squeeze(1),
+        #     int(A * 2 / 3), int(A * 2 / 3)
+        # )
+
+        # grd2sat_feature = project_point_clouds(
+        #     gaussians.means,
+        #     gaussians.features,
+        #     grd_camera.intrinsics.squeeze(1),
+        #     int(A * 2 / 3), int(A * 2 / 3)
+        # )
+        # grd2sat_confidence = project_point_clouds(
+        #     gaussians.means,
+        #     gaussians.confidences,
+        #     grd_camera.intrinsics.squeeze(1),
+        #     int(A * 2 / 3), int(A * 2 / 3)
+        # )
         # Weakly Supervised Loss Computation
         # crop_H = int(A - 20 * 3 / meter_per_pixel)
         # crop_W = int(A - 20 * 3 / meter_per_pixel)
-        crop_H = int(A // 2)
-        crop_W = int(A // 2)
+        crop_H = (int(A * 2 / 3))
+        crop_W = (int(A * 2 / 3))
         g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
         g2s_feat = F.normalize(g2s_feat.reshape(b, -1)).reshape(b, -1, crop_H, crop_W)
         g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
-        # grd2sat_color = TF.center_crop(grd2sat_color, [crop_H, crop_W])
+
+        grd2sat_color = TF.center_crop(grd2sat_color, [crop_H, crop_W])
         rgb_bev = grd2sat_color[0]
         rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
         test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
         test_img.save('splat_bev.png')
 
-        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
+        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align_ref"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
         test_img.save('sat_bev.png')
 
+        # g2s_conf = torch.ones_like(g2s_feat[:, :1, :, :]).float()
+        # g2s_conf = g2s_feat.any(dim=1, keepdim=True).float()
         # vis_bev(batch, gaussians)
         # single_features_to_RGB_colormap(grd2sat_feature, idx=0, img_name='bev_feature.png', cmap_name='rainbow')
         if self.train_cfg.weakly_supervised:
@@ -296,6 +312,134 @@ class ModelWrapper(LightningModule):
             self.step_tracker.set_step(self.global_step)
 
         return total_loss
+
+    @rank_zero_only
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        batch: BatchedExample = self.data_shim(batch)
+
+        b, v, _, h, w = batch["target"]["image"].shape
+
+        feat_img = batch["context"]["feat_image"]
+        grd_img = batch["context"]["image"]
+        b, v, _, h, w = grd_img.shape
+        feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
+        sat_img = batch["sat"]["sat_ref"]
+
+        if batch_idx % 100 == 0:
+            print(f"Test step {batch_idx:0>6}.")
+
+        # extract grd and sat feature
+        with torch.no_grad():
+            # dino
+            sat_feat = self.dino_feat(sat_img)
+            grd_feat = self.dino_feat(feat_img)
+            if isinstance(sat_feat, (tuple, list)):
+                sat_feats = [_f.detach() for _f in sat_feat]
+            if isinstance(grd_feat, (tuple, list)):
+                grd_feats = [_f.detach() for _f in grd_feat]
+
+        # dpt
+        sat_feat, sat_conf = self.dpt(sat_feats)
+        grd_feat, grd_conf = self.dpt(grd_feats)
+        A = sat_feat.shape[-1]
+        meter_per_pixel = self.meter_per_pixel * 512 / A
+
+        # Render Gaussians.
+        with self.benchmarker.time("encoder"):
+            gaussians, grd_camera = self.encoder(
+                grd_feat.shape[-2:], 
+                batch, 
+                self.global_step,
+            )
+        gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
+        gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
+
+        # get gaussian bev
+        if grd_camera is not None:
+            # intrinsics = grd_camera.intrinsics
+            # extrinsics = grd_camera.extrinsics
+            # output = self.decoder.forward(
+            #     gaussians,
+            #     extrinsics,
+            #     intrinsics,
+            #     batch["target"]["near"],
+            #     batch["target"]["far"],
+            #     (int(A * 2 / 3), int(A * 2 / 3)),
+            #     use_sh=False,
+            # )
+            # grd2sat_color = output.color.squeeze(1)
+            # grd2sat_feature = output.feature.squeeze(1)
+            # grd2sat_confidence = output.confidence.squeeze(1)
+            grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs(
+                gaussians,
+                (int(A * 2 / 3), int(A * 2 / 3)),
+                look_axis=2,
+                width=grd_camera.width,
+                height=grd_camera.height
+            )
+        
+        else:
+            heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
+            grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs(
+                gaussians,
+                (A, A),
+                heading=heading,
+                width=torch.tensor([A * meter_per_pixel] * b, dtype=torch.float32, device=batch["target"]["extrinsics"].device), 
+                height=torch.tensor([A * meter_per_pixel] * b, dtype=torch.float32, device=batch["target"]["extrinsics"].device)
+            )
+
+
+        # Weakly Supervised Loss Computation
+        crop_H = (int(A * 2 / 3))
+        crop_W = (int(A * 2 / 3))
+        g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_feat = F.normalize(g2s_feat.reshape(b, -1)).reshape(b, -1, crop_H, crop_W)
+        g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
+
+        rgb_bev = grd2sat_color[0]
+        rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
+        test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+        test_img.save('splat_bev.png')
+        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align_ref"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
+        test_img.save('sat_bev.png')
+        ### compute correlation
+        signal = sat_feat.reshape(1, -1, A, A)
+        kernel = g2s_feat * g2s_conf.pow(2)
+        corr = F.conv2d(signal, kernel, groups=b)[0]  # [B, H, W]
+
+        sat_feat_pow = (sat_feat).pow(2).transpose(0, 1)  # [B, C, H, W]->[C, B, H, W]
+        g2s_conf_pow = g2s_conf.pow(2)
+        denominator_sat = F.conv2d(sat_feat_pow, g2s_conf_pow, groups=b).transpose(0, 1)  # [B, C, H, W]
+        denominator_sat = torch.sqrt(torch.sum(denominator_sat, dim=1))  # [B, H, W]
+
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1)  # [B]
+        shape = denominator_sat.shape
+        denominator_grd = denom_grd[:, None, None].repeat(1, shape[1], shape[2])
+        denominator = denominator_sat * denominator_grd
+        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
+        corr = corr / denominator  # [B, H, W]
+        corr_H = int(20.0 * 3 / meter_per_pixel)
+        corr_W = int(20.0 * 3 / meter_per_pixel)
+        corr = TF.center_crop(corr[:, None], [corr_H, corr_W])[:, 0]
+
+        # compute pred_u and pred_v
+        max_index = torch.argmax(corr.reshape(b, -1), dim=1)
+
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lon
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lat
+
+        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位(m)
+        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位(m)
+        # Store pred_u and pred_v values in the lists
+        self.pred_lons.extend(pred_u.cpu().detach().numpy())
+        self.pred_lats.extend(pred_v.cpu().detach().numpy())
+        self.gt_lons.extend(gt_shift_u.cpu().detach().numpy())
+        self.gt_lats.extend(gt_shift_v.cpu().detach().numpy())
+
+        # Visualize positions on satellite image
+        self.visualize_positions_on_satellite(
+            corr, gaussians, batch, meter_per_pixel
+        )
 
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
@@ -412,7 +556,7 @@ class ModelWrapper(LightningModule):
         gt_shift_v = batch['sat']['gt_shift_v'][0, 0] * 20.0 # 单位：（m）
 
         # 获取卫星图像
-        sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
+        sat_img = batch['sat']['sat_ref'][0]  # 取第一个样本的卫星图像
 
         # 处理图像格式
         if isinstance(sat_img, torch.Tensor):
@@ -500,7 +644,7 @@ class ModelWrapper(LightningModule):
         ###### 保存原始卫星图 ######
         # 定义红点的半径（可以根据需要调整）
         radius = 5
-        sat_img = F.interpolate(batch['sat']['sat_align'], size=(H, W), mode='bilinear', align_corners=False)
+        sat_img = F.interpolate(batch['sat']['sat_align_ref'], size=(H, W), mode='bilinear', align_corners=False)
         test_img = to_pil_image(sat_img[0])
         # 创建一个可以在图像上绘图的对象
         draw = ImageDraw.Draw(test_img)
@@ -524,6 +668,14 @@ class ModelWrapper(LightningModule):
     def weakly_corr(self, sat_feat, g2s_feat, g2s_conf):
         # 这里实现弱监督相关性计算
         b = sat_feat.shape[0]
+        # 检查输入是否包含 NaN 或 Inf
+        if torch.isnan(sat_feat).any() or torch.isnan(g2s_feat).any() or torch.isnan(g2s_conf).any():
+            print("Warning: Input contains NaN values in supervise_corr")
+            # 用 0 替换 NaN 值
+            sat_feat = torch.nan_to_num(sat_feat, nan=0.0)
+            g2s_feat = torch.nan_to_num(g2s_feat, nan=0.0)
+            g2s_conf = torch.nan_to_num(g2s_conf, nan=0.0)
+
         signal = sat_feat.repeat(1, b, 1, 1)  #[B(M), BC(NC), H, W]
         kernel = g2s_feat * g2s_conf.pow(2)
         corr = F.conv2d(signal, kernel, groups=b)
@@ -544,23 +696,42 @@ class ModelWrapper(LightningModule):
 
     def supervise_corr(self, sat_feat, g2s_feat, g2s_conf):
         # 这里实现弱监督相关性计算
-        b, c, crop_H, crop_W = g2s_feat.shape
+        B, c, crop_H, crop_W = g2s_feat.shape
         A = sat_feat.shape[-1]
-        s_feat = sat_feat.reshape(1, -1, A, A)  # [B, C, H, W]->[1, B*C, H, W]
+
+        # 检查输入是否包含 NaN
+        if torch.isnan(sat_feat).any() or torch.isnan(g2s_feat).any() or torch.isnan(g2s_conf).any():
+            print("Warning: Input contains NaN values in supervise_corr")
+            # 用 0 替换 NaN 值
+            sat_feat = torch.nan_to_num(sat_feat, nan=0.0)
+            g2s_feat = torch.nan_to_num(g2s_feat, nan=0.0)
+            g2s_conf = torch.nan_to_num(g2s_conf, nan=0.0)
+
+        # numerator
+        signal = sat_feat.reshape(1, -1, A, A)    # [B, C, H, W]->[1, B*C, H, W]
+        kernel = g2s_feat * g2s_conf.pow(2)
+        corr = F.conv2d(signal, kernel, groups=B)[0]   # [B, H, W]
+
+        # denominator
+        sat_feat_pow = (sat_feat).pow(2).transpose(0, 1)  # [B, C, H, W]->[C, B, H, W]
         g2s_conf_pow = g2s_conf.pow(2)
+        denominator_sat = F.conv2d(sat_feat_pow, g2s_conf_pow, groups=B).transpose(0, 1)  # [B, C, H, W]
+        denominator_sat = torch.sqrt(torch.sum(denominator_sat, dim=1))  # [B, H, W]
 
-        corr = F.conv2d(s_feat, g2s_feat * g2s_conf_pow, groups=b)[0] # [B, H, W]
-
-        sat_feat_pow = sat_feat.pow(2)  # [B, C, H, W]
-        denominator_sat = torch.sum(F.conv2d(sat_feat_pow.transpose(0,1), g2s_conf_pow, groups=b), dim=0)  # [B, H, W]
-        # denominator_sat = torch.sum(sat_feat_pow, dim=1)  # [B, H, W]
-        denominator_sat = torch.maximum(torch.sqrt(denominator_sat), torch.ones_like(denominator_sat) * 1e-6)
-        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1)  # [B]
+        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(B, -1), dim=-1) # [B]
         shape = denominator_sat.shape
         denominator_grd = denom_grd[:, None, None].repeat(1, shape[1], shape[2])
-        denominator = denominator_sat * denominator_grd # [B, H, W]
-        corr = 2 - 2 * corr / denominator
-        return corr
+        denominator = denominator_sat * denominator_grd
+
+        # if args.use_uncertainty:
+        #     denominator = denominator * TF.center_crop(sat_uncer_dict[level], [corr.shape[1], corr.shape[2]])[:, 0]
+
+        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
+
+        corr = corr / denominator
+        corr_res = 2 - 2 * corr
+
+        return corr_res
 
 
     def on_test_end(self) -> None:
@@ -788,107 +959,6 @@ class ModelWrapper(LightningModule):
             self.pred_lats = []
             self.gt_lons = []
             self.gt_lats = []
-
-    @rank_zero_only
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        batch: BatchedExample = self.data_shim(batch)
-
-        b, v, _, h, w = batch["target"]["image"].shape
-
-        feat_img = batch["context"]["feat_image"]
-        grd_img = batch["context"]["image"]
-        b, v, _, h, w = grd_img.shape
-        feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
-        sat_img = batch["sat"]["sat"]
-
-        if batch_idx % 100 == 0:
-            print(f"Test step {batch_idx:0>6}.")
-
-        # extract grd and sat feature
-        with torch.no_grad():
-            # dino
-            sat_feat = self.dino_feat(sat_img)
-            grd_feat = self.dino_feat(feat_img)
-            if isinstance(sat_feat, (tuple, list)):
-                sat_feats = [_f.detach() for _f in sat_feat]
-            if isinstance(grd_feat, (tuple, list)):
-                grd_feats = [_f.detach() for _f in grd_feat]
-
-        # dpt
-        sat_feat, sat_conf = self.dpt(sat_feats)
-        grd_feat, grd_conf = self.dpt(grd_feats)
-        A = sat_feat.shape[-1]
-        meter_per_pixel = self.meter_per_pixel * 512 / A
-        # Render Gaussians.
-        with self.benchmarker.time("encoder"):
-            gaussians = self.encoder(
-                grd_feat.shape[-2:], 
-                batch["context"], 
-                self.global_step, 
-            )
-
-        gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
-        gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
-
-        # get gaussian bev
-        heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
-        grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
-            gaussians, 
-            (A // 2, A // 2),
-            heading=heading, 
-            width=A // 2 * meter_per_pixel, 
-            height=A // 2 * meter_per_pixel
-        )
-        crop_H = int(A // 2)
-        crop_W = int(A // 2)
-        g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
-        g2s_feat = F.normalize(g2s_feat.reshape(b, -1)).reshape(b, -1, crop_H, crop_W)
-        g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
-
-        rgb_bev = grd2sat_color[0]
-        rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
-        test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
-        test_img.save('splat_bev.png')
-        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
-        test_img.save('sat_bev.png')
-        ### compute correlation
-        signal = sat_feat.reshape(1, -1, A, A)
-        kernel = g2s_feat * g2s_conf.pow(2)
-        corr = F.conv2d(signal, kernel, groups=b)[0]  # [B, H, W]
-
-        sat_feat_pow = (sat_feat).pow(2).transpose(0, 1)  # [B, C, H, W]->[C, B, H, W]
-        g2s_conf_pow = g2s_conf.pow(2)
-        denominator_sat = F.conv2d(sat_feat_pow, g2s_conf_pow, groups=b).transpose(0, 1)  # [B, C, H, W]
-        denominator_sat = torch.sqrt(torch.sum(denominator_sat, dim=1))  # [B, H, W]
-
-        denom_grd = torch.linalg.norm((g2s_feat * g2s_conf).reshape(b, -1), dim=-1)  # [B]
-        shape = denominator_sat.shape
-        denominator_grd = denom_grd[:, None, None].repeat(1, shape[1], shape[2])
-        denominator = denominator_sat * denominator_grd
-        denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
-        corr = corr / denominator  # [B, H, W]
-        corr_H = int(20.0 * 3 / meter_per_pixel)
-        corr_W = int(20.0 * 3 / meter_per_pixel)
-        corr = TF.center_crop(corr[:, None], [corr_H, corr_W])[:, 0]
-
-        # compute pred_u and pred_v
-        max_index = torch.argmax(corr.reshape(b, -1), dim=1)
-
-        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lon
-        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lat
-
-        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位(m)
-        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位(m)
-        # Store pred_u and pred_v values in the lists
-        self.pred_lons.extend(pred_u.cpu().detach().numpy())
-        self.pred_lats.extend(pred_v.cpu().detach().numpy())
-        self.gt_lons.extend(gt_shift_u.cpu().detach().numpy())
-        self.gt_lats.extend(gt_shift_v.cpu().detach().numpy())
-
-        # Visualize positions on satellite image
-        self.visualize_positions_on_satellite(
-            corr, gaussians, batch, meter_per_pixel
-        )
 
     def configure_optimizers(self):
         new_params, new_param_names = [], []

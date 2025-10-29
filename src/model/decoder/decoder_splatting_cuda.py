@@ -42,6 +42,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         near: Float[Tensor, "batch view"],
         far: Float[Tensor, "batch view"],
         image_shape: tuple[int, int],
+        use_sh=False,
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
         color, feature, confidence, _, depth = render_cuda(
@@ -58,6 +59,7 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             repeat(gaussians.features, "b g c -> (b v) g c", v=v) if gaussians.features is not None else None,
             repeat(gaussians.confidences, "b g 1 -> (b v) g 1", v=v) if gaussians.confidences is not None else None,
             scale_invariant=self.make_scale_invariant,
+            use_sh=use_sh,
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
         feature = rearrange(feature, "(b v) c h w -> b v c h w", b=b, v=v) if feature is not None else None

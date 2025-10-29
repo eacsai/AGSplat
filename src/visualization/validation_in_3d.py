@@ -1,7 +1,7 @@
 import torch
 from jaxtyping import Float, Shaped
-from torch import Tensor, Union
-
+from torch import Tensor
+from typing import Union
 from ..model.decoder.cuda_splatting import render_cuda_orthographic
 from ..model.types import Gaussians
 from ..visualization.annotation import add_label

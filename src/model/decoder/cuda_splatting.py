@@ -111,6 +111,8 @@ def render_cuda(
         Float[Tensor, "batch height width"],
         Float[Tensor, "batch height width"],
     ]:
+    b, _, _ = extrinsics.shape
+    h, w = image_shape
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
     # Make sure everything is in a range where numerical issues don't appear.
@@ -129,10 +131,6 @@ def render_cuda(
 
     b, _, _ = extrinsics.shape
     h, w = image_shape
-
-    intrinsics = adjust_intrinsics_for_crop(
-        intrinsics, canonical_shape=(256,256), target_shape=image_shape
-    )
 
     fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
     tan_fov_x = (0.5 * fov_x).tan()
@@ -156,11 +154,17 @@ def render_cuda(
         except Exception:
             pass
 
+        # Ensure tanfov values are finite and positive
+        tanfovx_val = float(tan_fov_x[i].item()) if torch.isfinite(tan_fov_x[i]) else 0.1
+        tanfovy_val = float(tan_fov_y[i].item()) if torch.isfinite(tan_fov_y[i]) else 0.1
+        tanfovx_val = max(tanfovx_val, 1e-6)  # Ensure positive
+        tanfovy_val = max(tanfovy_val, 1e-6)  # Ensure positive
+
         settings = GaussianRasterizationSettings(
             image_height=h,
             image_width=w,
-            tanfovx=tan_fov_x[i].item(),
-            tanfovy=tan_fov_y[i].item(),
+            tanfovx=tanfovx_val,
+            tanfovy=tanfovy_val,
             bg=background_color[i],
             scale_modifier=1.0,
             viewmatrix=view_matrix[i],
@@ -256,7 +260,28 @@ def render_cuda_orthographic(
         near, far, repeat(fov_x, "-> b", b=b), fov_y
     )
     projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
-    view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
+
+    # 安全地处理外参矩阵求逆
+    try:
+        if torch.isnan(extrinsics).any() or torch.isinf(extrinsics).any():
+            print("Warning: extrinsics contains NaN/Inf in render_cuda_orthographic, using identity matrix")
+            view_matrix = torch.eye(4, device=extrinsics.device).unsqueeze(0).repeat(extrinsics.shape[0], 1, 1)
+        else:
+            # 检查行列式，避免奇异矩阵
+            det = torch.det(extrinsics)
+            if torch.any(torch.abs(det) < 1e-6):
+                print("Warning: extrinsics is singular in render_cuda_orthographic, using identity matrix")
+                view_matrix = torch.eye(4, device=extrinsics.device).unsqueeze(0).repeat(extrinsics.shape[0], 1, 1)
+            else:
+                view_matrix = extrinsics.inverse()
+                if torch.isnan(view_matrix).any():
+                    print("Warning: extrinsics inversion produced NaN in render_cuda_orthographic, using identity matrix")
+                    view_matrix = torch.eye(4, device=extrinsics.device).unsqueeze(0).repeat(extrinsics.shape[0], 1, 1)
+    except Exception as e:
+        print(f"Warning: Error in extrinsics inversion in render_cuda_orthographic ({e}), using identity matrix")
+        view_matrix = torch.eye(4, device=extrinsics.device).unsqueeze(0).repeat(extrinsics.shape[0], 1, 1)
+
+    view_matrix = rearrange(view_matrix, "b i j -> b j i")
     full_projection = view_matrix @ projection_matrix
 
     all_images = []
@@ -386,8 +411,8 @@ def render_bevs(
 
         color, feature, confidence, mask, depth = render_cuda_orthographic(
             extrinsics_rotated,
-            torch.tensor([width], device=device, dtype=torch.float32),
-            torch.tensor([height], device=device, dtype=torch.float32),
+            torch.tensor(width[b:b+1], device=device, dtype=torch.float32),
+            torch.tensor(height[b:b+1], device=device, dtype=torch.float32),
             near,
             far,
             resolution,

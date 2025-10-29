@@ -1,6 +1,6 @@
 import os
 import warnings
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 指定使用的GPU设备ID
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
 
 # 设置 DDP 相关环境变量来优化性能
 os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息

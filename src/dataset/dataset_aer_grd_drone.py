@@ -27,7 +27,6 @@ import os
 ROOT_DIR   = '/data/zhongyao/aer-grd-map'   
 GrdOriImg_H = 1080
 GrdOriImg_W = 1920
-GrdImg_H, GrdImg_W = 256, 512             # 地面/航拍图 resize 后尺寸，原始数据：1080*1920
 SatMap_SIDE = 1024                        # 卫星图输出边长，原始数据：2700*2700
 # --------------------------------
 satmap_dir = 'satmap'
@@ -36,16 +35,21 @@ satmap_dir = 'satmap'
 @dataclass
 class DatasetAerGrdDroneCfg(DatasetCfgCommon):
     name: str
-
+    sat_rot_align: bool = False
+    GrdImg_H: int = 256
+    GrdImg_W: int = 512
 
 @dataclass
 class DatasetAerGrdDroneCfgWrapper:
     aer_grd_drone: DatasetAerGrdDroneCfg
 
-Default_lat = 49.015
+@dataclass
+class DatasetAerGrdDronePi3CfgWrapper:
+    aer_grd_drone_pi3: DatasetAerGrdDroneCfg
+
 Satmap_zoom = 18
-SatMap_original_sidelength = 512 # 0.2 m per pixel
-SatMap_process_sidelength = 512 # 0.2 m per pixel
+SatMap_resize_sidelength = 512 # 0.4 m per pixel
+SatMap_crop_sidelength = 512
 
 # 将 COLMAP 坐标系 (Z向上) 转换为 OpenCV 坐标系 (Z向前)
 # 转换矩阵: 绕 X 轴旋转 π，将 Y 轴翻转，Z 轴从向上变为向前
@@ -63,12 +67,6 @@ colmap_to_opencv = np.array([
     [0, 0, 0, 1]
 ], dtype=np.float32)
 
-def get_meter_per_pixel(lat=Default_lat, zoom=Satmap_zoom, scale=SatMap_process_sidelength/SatMap_original_sidelength):
-    meter_per_pixel = 156543.03392 * np.cos(lat * np.pi/180.) / (2**zoom)	
-    meter_per_pixel /= 2 # because use scale 2 to get satmap 
-    meter_per_pixel /= scale
-    return meter_per_pixel
-
 class DatasetAerGrdDrone(IterableDataset):
     cfg: DatasetAerGrdDroneCfg
     stage: Stage
@@ -77,7 +75,7 @@ class DatasetAerGrdDrone(IterableDataset):
     to_tensor: tf.ToTensor
     chunks: list[Path]
     near: float = 0.1
-    far: float = 100.0
+    far: float = 150.0
 
     def __init__(
         self,
@@ -92,43 +90,41 @@ class DatasetAerGrdDrone(IterableDataset):
         self.to_tensor = tf.ToTensor()        
         self.pro_grdimage_dir = 'depth_data'
         if self.stage in ("train"):
-            with open('/data/zhongyao/aer-grd-map/train_files_1024.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/train_files_1027.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
         else:
-            with open('/data/zhongyao/aer-grd-map/test_files_1024.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/test_files_1027.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
-        self.final_h = GrdImg_W   # 1024
-        self.final_w = GrdImg_W   # 1024
+        self.final_h = cfg.GrdImg_H   # 1024
+        self.final_w = cfg.GrdImg_W   # 1024
         self.rotation_range = 0
-        self.padding_top = (self.final_h - GrdImg_H) // 2
-        self.padding_left = (self.final_w - GrdImg_W) // 2
+        self.padding_top = (self.final_w - cfg.GrdImg_H) // 2
+        self.padding_left = (self.final_w - cfg.GrdImg_W) // 2
         self.grdimage_transform = transforms.Compose([
-            transforms.Resize(size=[GrdImg_H, GrdImg_W]),
+            transforms.Resize(size=[cfg.GrdImg_H, cfg.GrdImg_W]),
             transforms.Pad(padding=(self.padding_left, self.padding_top, self.padding_left, self.padding_top), fill=0),
             transforms.ToTensor(),
         ])
         self.mask_transform = transforms.Compose([
-            transforms.Resize(size=[GrdImg_H, GrdImg_W]),
+            transforms.Resize(size=[cfg.GrdImg_H, cfg.GrdImg_W]),
             transforms.Pad(padding=(self.padding_left, self.padding_top, self.padding_left, self.padding_top), fill=1),
             transforms.ToTensor(),
         ])
-        self.satmap_transform = transforms.Compose([
-            transforms.Resize(size=[SatMap_process_sidelength, SatMap_process_sidelength]),
+
+        self.satmap_transform_pi3 = transforms.Compose([
+            transforms.Resize(size=self.cfg.input_image_shape),
             transforms.ToTensor(),
         ])
 
-        self.meter_per_pixel = 0.32307    # zoom=18；210 m / 650 px
-        # self.grdimage_transform = transforms.Compose([
-        #     transforms.Resize(size=[256, 1024]),
-        #     transforms.ToTensor(),
-        # ])
+        self.satmap_transform_ref = transforms.Compose([
+            transforms.Resize(size=[SatMap_resize_sidelength, SatMap_resize_sidelength]),
+            transforms.ToTensor(),
+        ])
 
         self.shift_range_meters_lat = shift_range_lat  # in terms of meters
         self.shift_range_meters_lon = shift_range_lon  # in terms of meters
-        self.shift_range_pixels_lat = shift_range_lat / self.meter_per_pixel  # shift range is in terms of meters
-        self.shift_range_pixels_lon = shift_range_lon / self.meter_per_pixel  # shift range is in terms of meters
 
     def shuffle(self, lst: list) -> list:
         indices = torch.randperm(len(lst))
@@ -174,18 +170,14 @@ class DatasetAerGrdDrone(IterableDataset):
             grd_mask = Image.open(grd_mask_path).convert('L')
             drone_mask = Image.open(drone_mask_path).convert('L')
 
-            # 对卫星图进行4倍下采样
-            new_size = (650, 650)
-            sat_img = sat_img.resize(new_size, Image.BILINEAR)
-
             # 2. 内参与位姿
             npz_path = grd_path.replace('.jpeg.jpg', '.jpeg.npz')
             npz = np.load(npz_path)
             K = torch.from_numpy(npz['intrinsics'].astype(np.float32))  # (3,3)
-            fx = K[0, 0] * GrdImg_W / GrdOriImg_W / self.final_w
-            fy = K[1, 1] * GrdImg_H / GrdOriImg_H / self.final_h
-            cx = (K[0, 2] * GrdImg_W / GrdOriImg_W + self.padding_left) / self.final_w
-            cy = (K[1, 2] * GrdImg_H / GrdOriImg_H + self.padding_top) / self.final_h
+            fx = K[0, 0] * self.cfg.GrdImg_W / GrdOriImg_W / self.final_w
+            fy = K[1, 1] * self.cfg.GrdImg_H / GrdOriImg_H / self.final_h
+            cx = (K[0, 2] * self.cfg.GrdImg_W / GrdOriImg_W + self.padding_left) / self.final_w
+            cy = (K[1, 2] * self.cfg.GrdImg_H / GrdOriImg_H + self.padding_top) / self.final_h
             left_camera_k = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32)
             cam2world = npz['cam2world']
             cam2world = colmap_to_opencv @ cam2world
@@ -195,35 +187,43 @@ class DatasetAerGrdDrone(IterableDataset):
             # 自定义坐标系: Z正东, X正南, Y朝下
             # 相机朝向是+Z轴方向，cam2world[2, 2]表示相机Z轴在世界坐标系Z方向(正东)的分量
             # cam2world[0, 2]表示相机Z轴在世界坐标系X方向(正南)的分量
+            # heading 表示相机朝向相对于正东方向的偏转角，正值表示顺时针旋转，负值表示逆时针旋转
             heading = np.arctan2(cam2world[0, 2], cam2world[2, 2])
-
             # 转换为度数制，便于理解
             heading_degrees = np.degrees(heading)
 
-            # 确保角度在 [0, 360) 范围内
-            if heading_degrees < 0:
-                heading_degrees += 360 
-
-            # 3. randomly generate shift
+            # 3. 处理卫星图
+            meter_per_pixel = 300 / min(sat_img.size)
+            # randomly generate shift
             # gt_shift_x负数的时候向右移动，正数的时候向左移动
             # gt_shift_y负数的时候向下移动，正数的时候向上移动
             # theta负数的时候顺时针旋转，正数的时候逆时针旋转
-            dx_p = gt_shift_x * self.shift_range_meters_lon / self.meter_per_pixel
-            dy_p = gt_shift_y * self.shift_range_meters_lat / self.meter_per_pixel
-            sat_rand_shift = sat_img.transform(
-                sat_img.size, Image.AFFINE,
-                (1, 0, dx_p, 0, 1, -dy_p), resample=Image.BILINEAR)
-
+            dx_p = gt_shift_x * self.shift_range_meters_lon / meter_per_pixel
+            dy_p = gt_shift_y * self.shift_range_meters_lat / meter_per_pixel
+            if self.cfg.sat_rot_align:
+                sat_aligh_cam = sat_img.rotate(heading_degrees)
+            else:
+                sat_aligh_cam = sat_img
+            sat_rand_shift = sat_aligh_cam.transform(
+                sat_aligh_cam.size, Image.AFFINE,
+                (1, 0, dx_p, 0, 1, -dy_p), resample=Image.BILINEAR
+            )
+            
             # randomly generate roation
             sat_rand_shift_rand_rot = \
                 sat_rand_shift.rotate(theta * self.rotation_range)
 
-            sat_rand_shift_rand_rot_central_crop = TF.center_crop(sat_rand_shift_rand_rot, SatMap_process_sidelength)
-            sat_align_cam_central_crop = TF.center_crop(sat_img, SatMap_process_sidelength)
+            # central crop
+            sat_rand_shift_rand_rot_central_crop_ref = TF.center_crop(sat_rand_shift_rand_rot, 210 / meter_per_pixel)
+            sat_rand_shift_rand_rot_central_crop_pi3 = TF.center_crop(sat_rand_shift_rand_rot, 140 / meter_per_pixel)
+            sat_align_cam_central_crop_ref = TF.center_crop(sat_aligh_cam, 210 / meter_per_pixel)
+            sat_align_cam_central_crop_pi3 = TF.center_crop(sat_aligh_cam, 140 / meter_per_pixel)
 
-            if self.satmap_transform is not None:
-                sat_rand_shift_rand_rot_central_crop = self.satmap_transform(sat_rand_shift_rand_rot_central_crop)
-                sat_align_cam_central_crop = self.satmap_transform(sat_align_cam_central_crop)
+            # transform to tensor & resize
+            sat_rand_shift_rand_rot_central_crop_ref = self.satmap_transform_ref(sat_rand_shift_rand_rot_central_crop_ref)
+            sat_rand_shift_rand_rot_central_crop_pi3 = self.satmap_transform_pi3(sat_rand_shift_rand_rot_central_crop_pi3)
+            sat_align_cam_central_crop_ref = self.satmap_transform_ref(sat_align_cam_central_crop_ref)
+            sat_align_cam_central_crop_pi3 = self.satmap_transform_pi3(sat_align_cam_central_crop_pi3)
 
             if self.grdimage_transform is not None:
                 grd_left_feat = self.grdimage_transform(grd_left_feat).unsqueeze(0)
@@ -234,17 +234,17 @@ class DatasetAerGrdDrone(IterableDataset):
             extrinsics = torch.eye(4, dtype=torch.float32)
             # 添加 batch 维度以适应 F.interpolate，然后移除
 
-            grd_img = F.interpolate(grd_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
-            drone_img = F.interpolate(drone_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
-            grd_mask = F.interpolate(grd_mask.float(), size=self.cfg.input_image_shape, mode='bilinear', align_corners=False).squeeze(1)
-            drone_mask = F.interpolate(drone_mask.float(), size=self.cfg.input_image_shape, mode='bilinear', align_corners=False).squeeze(1)
+            grd_img_pi3 = F.interpolate(grd_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
+            drone_img_pi3 = F.interpolate(drone_left_feat, size=self.cfg.input_image_shape, mode='bilinear', align_corners=False)
+            grd_mask_pi3 = F.interpolate(grd_mask.float(), size=self.cfg.input_image_shape, mode='bilinear', align_corners=False).squeeze(1)
+            drone_mask_pi3 = F.interpolate(drone_mask.float(), size=self.cfg.input_image_shape, mode='bilinear', align_corners=False).squeeze(1)
 
             example = {
                 "context": {
                     "extrinsics": torch.stack((cam2world, cam2world), dim=0),
                     "intrinsics": torch.stack((left_camera_k, left_camera_k), dim=0),
-                    "image": torch.cat((grd_img, drone_img), dim=0),
-                    "mask": torch.cat((grd_mask, drone_mask), dim=0),
+                    "image": torch.cat((grd_img_pi3, drone_img_pi3), dim=0),
+                    "mask": torch.cat((grd_mask_pi3, drone_mask_pi3), dim=0),
                     "feat_image": torch.cat((grd_left_feat, grd_left_feat), dim=0),
                     "near": self.get_bound("near", 1),
                     "far": self.get_bound("far", 1),
@@ -256,14 +256,16 @@ class DatasetAerGrdDrone(IterableDataset):
                 "target": {
                     "extrinsics": extrinsics[None],
                     "intrinsics": left_camera_k[None],
-                    "image": grd_img,
+                    "image": grd_img_pi3,
                     "near": self.get_bound("near", 1),
                     "far": self.get_bound("far", 1),
                     "index": torch.tensor([0], dtype=torch.int64),
                 },
                 "sat": {
-                    "sat_align": sat_align_cam_central_crop,
-                    "sat": sat_rand_shift_rand_rot_central_crop,
+                    "sat_align_ref": sat_align_cam_central_crop_ref,
+                    "sat_align_pi3": sat_align_cam_central_crop_pi3,
+                    "sat_ref": sat_rand_shift_rand_rot_central_crop_ref,
+                    "sat_pi3": sat_rand_shift_rand_rot_central_crop_pi3,
                     "gt_shift_u": torch.tensor([-gt_shift_x], dtype=torch.float32),
                     "gt_shift_v": torch.tensor([gt_shift_y], dtype=torch.float32),
                     "gt_heading": torch.tensor([heading], dtype=torch.float32),
@@ -272,7 +274,7 @@ class DatasetAerGrdDrone(IterableDataset):
                 },
                 "scene": 'kitti',
             }
-            yield apply_crop_shim(example, tuple(self.cfg.input_image_shape))
+            yield example
 
     def convert_images(
         self,

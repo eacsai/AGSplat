@@ -151,10 +151,11 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
     def forward(
         self,
         feat_size: tuple[int, int],
-        context: dict,
+        batch: dict,
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
     ) -> Gaussians:
+        context = batch["context"]
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
         mask = F.interpolate(context['mask'], size=feat_size, mode='nearest')
@@ -295,7 +296,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 gaussians.opacities,
                 "b v r srf spp -> b (v r srf spp)",
             ),
-        )
+        ), None
 
     def get_data_shim(self) -> DataShim:
         def data_shim(batch: BatchedExample) -> BatchedExample:

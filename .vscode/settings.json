@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "/home/wangqw/CVPR26/NoPoSplat/diff-gaussian-rasterization-w-pose"
+    "cmake.sourceDirectory": "/home/wangqw/CVPR26/NoPoSplat/diff-gaussian-rasterization-w-pose",
+    "liveServer.settings.port": 5502
 }
