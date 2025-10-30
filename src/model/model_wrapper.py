@@ -289,7 +289,7 @@ class ModelWrapper(LightningModule):
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
 
-        self.log("loss/total", total_loss)
+        self.log("loss/total", total_loss.item())
 
         if (
             self.global_rank == 0
@@ -302,7 +302,7 @@ class ModelWrapper(LightningModule):
                 f"train step {self.global_step}; "
                 f"scene = {[x[:20] for x in batch['scene']]}; "
                 f"context = {batch['context']['index'].tolist()}; "
-                f"loss = {total_loss:.6f}; "
+                f"loss = {total_loss.item():.6f}; "
                 f"lr = {current_lr:.2e}"
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor

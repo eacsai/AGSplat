@@ -25,6 +25,11 @@ inf = float('inf')
 debug = False
 
 @dataclass
+class GroundCamera:
+    width: float  # 摄像机图像宽度
+    height: float  # 摄像机图像高度
+
+@dataclass
 class OpacityMappingCfg:
     initial: float
     final: float
@@ -191,7 +196,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
                 GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
 
         extrinsics1 = context["extrinsics"][:, 0]  # cam2world [b, 4, 4]
-        pts3d1 = res1['pts3d'] * 40 # [b, h, w, 3]
+        pts3d1 = res1['pts3d'] # [b, h, w, 3]
 
         pts3d1 = F.interpolate(pts3d1.permute(0, 3, 1, 2), size=feat_size, mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
         # 将点云从相机坐标系转换到世界坐标系（使用转置）
@@ -202,7 +207,7 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
         pts3d1 = rearrange(pts3d1, "b h w d -> b (h w) d")
 
         extrinsics2 = context["extrinsics"][:, 0]  # cam2world [b, 4, 4]
-        pts3d2 = res2['pts3d'] * 40 # [b, h, w, 3]
+        pts3d2 = res2['pts3d'] # [b, h, w, 3]
 
         pts3d2 = F.interpolate(pts3d2.permute(0, 3, 1, 2), size=feat_size, mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
         # 将点云从相机坐标系转换到世界坐标系（使用转置）
@@ -281,22 +286,25 @@ class EncoderNoPoSplat(Encoder[EncoderNoPoSplatCfg]):
 
         return Gaussians(
             rearrange(
-                gaussians.means,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
+                context['grd_camera']['pts_gd'].detach(),
+                "b v r xyz -> b (v r) xyz",
             ),
             rearrange(
                 gaussians.covariances,
                 "b v r srf spp i j -> b (v r srf spp) i j",
             ),
             rearrange(
-                rgb_all,
+                rgb_all.detach(),
                 "b v r 1 c -> b (v r) c 1",
             ),
             rearrange(
                 gaussians.opacities,
                 "b v r srf spp -> b (v r srf spp)",
             ),
-        ), None
+        ), GroundCamera(
+            width=context['grd_camera']['width'].squeeze(-1).detach(),
+            height=context['grd_camera']['height'].squeeze(-1).detach(),
+        )
 
     def get_data_shim(self) -> DataShim:
         def data_shim(batch: BatchedExample) -> BatchedExample:

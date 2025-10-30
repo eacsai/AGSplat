@@ -57,12 +57,16 @@ def vis_bev(batch, gaussians):
     test_img = to_pil_image(project_img[0].clamp(min=0,max=1))
     test_img.save('direct_project.png')
     # write_ply(gaussians.means[0].cpu().detach().numpy(), point_color[0].cpu().detach().numpy())
-
-    rgb_input = (batch['context']["image"][0,0] + 1) / 2
+    if batch['context']["image"][0,0].min() < -0.1:
+        rgb_input = (batch['context']["image"][0,0] + 1) / 2
+    else:
+        rgb_input = batch['context']["image"][0,0]
     test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
     test_img.save('input1.png')
-
-    rgb_input = (batch['context']["image"][0,1] + 1) / 2
+    if batch['context']["image"][0,1].min() < -0.1:
+        rgb_input = (batch['context']["image"][0,1] + 1) / 2
+    else:
+        rgb_input = batch['context']["image"][0,1]
     test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
     test_img.save('input2.png')
 
@@ -74,7 +78,7 @@ def vis_bev(batch, gaussians):
     test_img = to_pil_image(mask_input.clamp(min=0,max=1))
     test_img.save('mask2.png')
 
-    sat_img = F.interpolate(batch['sat']['sat_align'], size=(512, 512), mode='bilinear', align_corners=False)
+    sat_img = F.interpolate(batch['sat']['sat_align_ref'], size=(512, 512), mode='bilinear', align_corners=False)
     test_img = to_pil_image(sat_img[0])
 
     # 获取图像的宽度和高度
@@ -98,7 +102,7 @@ def vis_bev(batch, gaussians):
                 fill=(255, 0, 0), outline=(255, 0, 0)) # 填充和边框都设为红色
     test_img.save('sat_align.png')
 
-    sat_img = F.interpolate(batch['sat']['sat'], size=(512, 512), mode='bilinear', align_corners=False)
+    sat_img = F.interpolate(batch['sat']['sat_ref'], size=(512, 512), mode='bilinear', align_corners=False)
     test_img = to_pil_image(sat_img[0])
 
     # 获取图像的宽度和高度

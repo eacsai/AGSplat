@@ -4,7 +4,7 @@ defaults:
 
 name: aer_grd_drone_pi3
 
-input_image_shape: [252, 252]
+input_image_shape: [128, 128]
 original_image_shape: [1080, 1920]
 cameras_are_circular: false
 

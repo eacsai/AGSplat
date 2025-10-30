@@ -19,7 +19,7 @@ data_loader:
   train:
     num_workers: 32
     persistent_workers: true
-    batch_size: 8
+    batch_size: 2
     seed: 7788
   test:
     num_workers: 1
@@ -63,7 +63,7 @@ test:
   save_video: false
   save_compare: false
 
-seed: 111123
+seed: 111
 
 trainer:
   max_steps: 25000
@@ -72,7 +72,7 @@ trainer:
   check_val_every_n_epoch: 1
   max_epochs: 10
   enable_progress_bar: true
-  num_sanity_val_steps: 6
+  num_sanity_val_steps: 0
 
 hydra:
   run:

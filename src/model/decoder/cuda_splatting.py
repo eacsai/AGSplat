@@ -411,8 +411,8 @@ def render_bevs(
 
         color, feature, confidence, mask, depth = render_cuda_orthographic(
             extrinsics_rotated,
-            torch.tensor(width[b:b+1], device=device, dtype=torch.float32),
-            torch.tensor(height[b:b+1], device=device, dtype=torch.float32),
+            width[b:b+1].clone().detach(),
+            height[b:b+1].clone().detach(),
             near,
             far,
             resolution,

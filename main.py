@@ -1,14 +1,38 @@
 import os
 import warnings
+import random
+import numpy as np
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
 
 # 设置 DDP 相关环境变量来优化性能
 os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 优化内存分配
 
+# 设置确定性计算以获得可复现的结果
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # 确保CUDA运算确定性
+os.environ["PYTHONHASHSEED"] = "0"
+
 # 过滤 PyTorch 的警告
 warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match bucket view strides.*")
+
+def fix_random_seed(seed: int = 42):
+    """固定所有随机种子以确保可复现性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # 设置确定性模式（可能会影响性能）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # 确保所有CUDA操作都是确定性的
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    print(f"Random seed fixed to: {seed}")
 
 from pathlib import Path
 
@@ -59,6 +83,9 @@ def train(cfg_dict: DictConfig):
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
 
+    # 固定随机种子以确保可复现的初始化
+    fix_random_seed(cfg_dict.seed)
+
     # Set up the output directory.
     output_dir = cfg.train.output_path / f"exp_{cfg.wandb['name']}"
     output_dir = Path(output_dir)
@@ -99,7 +126,7 @@ def train(cfg_dict: DictConfig):
     callbacks[-1].CHECKPOINT_EQUALS_CHAR = '_'
 
     # Add callback to save initial weights
-    callbacks.append(SaveInitialWeightsCallback())
+    # callbacks.append(SaveInitialWeightsCallback())
 
     # 添加Rich进度条Callbacks
     callbacks.append(RichProgressBar(
@@ -141,7 +168,7 @@ def train(cfg_dict: DictConfig):
     # Load the encoder weights.
     if cfg.model.encoder.pretrained_weights and cfg.mode == "train":
         weight_path = cfg.model.encoder.pretrained_weights
-        ckpt_weights = torch.load(weight_path, map_location='cpu')
+        ckpt_weights = torch.load(weight_path, map_location='cpu', weights_only=False)
         if 'model' in ckpt_weights:
             ckpt_weights = ckpt_weights['model']
             ckpt_weights = checkpoint_filter_fn(ckpt_weights, encoder)

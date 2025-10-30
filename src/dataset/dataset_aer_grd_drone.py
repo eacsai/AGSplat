@@ -183,6 +183,13 @@ class DatasetAerGrdDrone(IterableDataset):
             cam2world = colmap_to_opencv @ cam2world
             cam2world = torch.from_numpy(cam2world.astype(np.float32))
 
+            grd_camera_path = grd_path.split('/')
+            grd_camera_name = grd_camera_path[-1].replace('.jpeg.jpg', '')
+            drone_camera_path = drone_path.split('/')
+            drone_camera_name = drone_camera_path[-1].replace('.jpeg.jpg', '')
+            camera_path = os.path.join('/', *grd_camera_path[0:5], 'grd_camera', f'{grd_camera_name}_{drone_camera_name}_grd_camera.pt')
+            grd_camera = torch.load(camera_path, map_location='cpu', weights_only=True)
+
             # 计算相机朝向(+Z轴方向)相对于世界坐标系Z轴方向(正东)的偏转角
             # 自定义坐标系: Z正东, X正南, Y朝下
             # 相机朝向是+Z轴方向，cam2world[2, 2]表示相机Z轴在世界坐标系Z方向(正东)的分量
@@ -252,6 +259,7 @@ class DatasetAerGrdDrone(IterableDataset):
                     "overlap": torch.tensor([0.5], dtype=torch.float32),
                     "grd_path": grd_path,
                     "drone_path": drone_path,
+                    "grd_camera": grd_camera,
                 },
                 "target": {
                     "extrinsics": extrinsics[None],
