@@ -154,6 +154,54 @@ class ModelWrapper(LightningModule):
         self.gt_lons = []
         self.gt_lats = []
 
+        # 记录脏数据的列表
+        self.dirty_data_log = []
+
+    def log_dirty_data(self, batch, function_name, additional_info=None):
+        """记录脏数据信息以便后续删除"""
+        if batch is None:
+            return
+
+        dirty_info = {
+            'function_name': function_name,
+            'global_step': self.global_step,
+            'timestamp': torch.tensor(self.global_step, dtype=torch.float32).item(),
+        }
+
+        # 如果有额外信息
+        if additional_info:
+            dirty_info.update(additional_info)
+
+        # 打印信息
+        print(f"=== DIRTY DATA DETECTED ===")
+        print(f"Function: {function_name}")
+        print(f"Global step: {self.global_step}")
+        for key, value in dirty_info.items():
+            if key not in ['function_name', 'global_step', 'timestamp']:
+                print(f"{key}: {value}")
+        print("==========================")
+
+        # 添加到日志
+        self.dirty_data_log.append(dirty_info)
+
+        # 可选：保存到文件
+        if len(self.dirty_data_log) % 10 == 1:  # 每10条脏数据记录保存一次
+            self.save_dirty_data_log()
+
+    def save_dirty_data_log(self):
+        """保存脏数据日志到文件"""
+        if not self.dirty_data_log:
+            return
+
+        import json
+        save_path = self.train_cfg.output_path / "dirty_data_log.json"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(save_path, 'w') as f:
+            json.dump(self.dirty_data_log, f, indent=2, default=str)
+
+        print(f"Dirty data log saved to {save_path}")
+
     def training_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
         # Render Gaussians.
@@ -262,9 +310,9 @@ class ModelWrapper(LightningModule):
         # vis_bev(batch, gaussians)
         # single_features_to_RGB_colormap(grd2sat_feature, idx=0, img_name='bev_feature.png', cmap_name='rainbow')
         if self.train_cfg.weakly_supervised:
-            corr = self.weakly_corr(sat_feat, g2s_feat, g2s_conf)
+            corr = self.weakly_corr(sat_feat, g2s_feat, g2s_conf, batch)
         else:
-            corr = self.supervise_corr(sat_feat, g2s_feat, g2s_conf)
+            corr = self.supervise_corr(sat_feat, g2s_feat, g2s_conf, batch)
 
         # self.visualize_positions_on_satellite(
         #     corr, gaussians, batch
@@ -298,12 +346,21 @@ class ModelWrapper(LightningModule):
             # 获取当前学习率
             current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
 
+            # 计算梯度范数
+            total_norm = 0
+            param_count = 0
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    param_count += 1
+            total_norm = total_norm ** (1. / 2)
+
             print(
                 f"train step {self.global_step}; "
-                f"scene = {[x[:20] for x in batch['scene']]}; "
-                f"context = {batch['context']['index'].tolist()}; "
                 f"loss = {total_loss.item():.6f}; "
-                f"lr = {current_lr:.2e}"
+                f"lr = {current_lr:.2e}; "
+                f"grad_norm = {total_norm:.6f}"
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
@@ -399,9 +456,9 @@ class ModelWrapper(LightningModule):
         rgb_bev = grd2sat_color[0]
         rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
         test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
-        test_img.save('splat_bev.png')
+        test_img.save('splat_bev_t.png')
         test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align_ref"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
-        test_img.save('sat_bev.png')
+        test_img.save('sat_bev_t.png')
         ### compute correlation
         signal = sat_feat.reshape(1, -1, A, A)
         kernel = g2s_feat * g2s_conf.pow(2)
@@ -450,7 +507,7 @@ class ModelWrapper(LightningModule):
         grd_img = batch["context"]["image"]
         b, v, _, h, w = grd_img.shape
         feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
-        sat_img = batch["sat"]["sat"]
+        sat_img = batch["sat"]["sat_ref"]
 
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
@@ -469,35 +526,66 @@ class ModelWrapper(LightningModule):
         sat_feat, sat_conf = self.dpt(sat_feats)
         grd_feat, grd_conf = self.dpt(grd_feats)
         A = sat_feat.shape[-1]
+        meter_per_pixel = self.meter_per_pixel * 512 / A
 
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
-            gaussians = self.encoder(
-                batch["context"],
+            gaussians, grd_camera = self.encoder(
+                grd_feat.shape[-2:], 
+                batch, 
                 self.global_step,
             )
-
         gaussians.features = rearrange(grd_feat, "(b v) c h w -> b (v h w) c", b=b, v=v)
         gaussians.confidences = rearrange(grd_conf, "(b v) c h w -> b (v h w) c", b=b, v=v)
 
         # get gaussian bev
-        heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
-        grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs( 
-            gaussians, 
-            (A, A),
-            heading=heading, 
-            width=100.0, 
-            height=100.0
-        )
-        crop_H = int(A - 20 * 3 / self.meters_per_pixel)
-        crop_W = int(A - 20 * 3 / self.meters_per_pixel)
+        if grd_camera is not None:
+            # intrinsics = grd_camera.intrinsics
+            # extrinsics = grd_camera.extrinsics
+            # output = self.decoder.forward(
+            #     gaussians,
+            #     extrinsics,
+            #     intrinsics,
+            #     batch["target"]["near"],
+            #     batch["target"]["far"],
+            #     (int(A * 2 / 3), int(A * 2 / 3)),
+            #     use_sh=False,
+            # )
+            # grd2sat_color = output.color.squeeze(1)
+            # grd2sat_feature = output.feature.squeeze(1)
+            # grd2sat_confidence = output.confidence.squeeze(1)
+            grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs(
+                gaussians,
+                (int(A * 2 / 3), int(A * 2 / 3)),
+                look_axis=2,
+                width=grd_camera.width,
+                height=grd_camera.height
+            )
+        
+        else:
+            heading = torch.zeros([b, 1], dtype=torch.float32, requires_grad=True, device=batch["target"]["extrinsics"].device)
+            grd2sat_color, grd2sat_feature, grd2sat_confidence = render_bevs(
+                gaussians,
+                (A, A),
+                heading=heading,
+                width=torch.tensor([A * meter_per_pixel] * b, dtype=torch.float32, device=batch["target"]["extrinsics"].device), 
+                height=torch.tensor([A * meter_per_pixel] * b, dtype=torch.float32, device=batch["target"]["extrinsics"].device)
+            )
+
+
+        # Weakly Supervised Loss Computation
+        crop_H = (int(A * 2 / 3))
+        crop_W = (int(A * 2 / 3))
         g2s_feat = TF.center_crop(grd2sat_feature, [crop_H, crop_W])
+        g2s_feat = F.normalize(g2s_feat.reshape(b, -1)).reshape(b, -1, crop_H, crop_W)
         g2s_conf = TF.center_crop(grd2sat_confidence, [crop_H, crop_W])
 
         rgb_bev = grd2sat_color[0]
-        test_img = to_pil_image(rgb_bev)
-        test_img.save('splat_bev.png')
-
+        rgb_bev = TF.center_crop(rgb_bev, [crop_H, crop_W])
+        test_img = to_pil_image(rgb_bev.clamp(min=0,max=1))
+        test_img.save('splat_bev_t.png')
+        test_img = to_pil_image(F.interpolate(batch["sat"]["sat_align_ref"], size=(A, A), mode='bilinear', align_corners=False)[0].clamp(min=0,max=1))
+        test_img.save('sat_bev_t.png')
         ### compute correlation
         signal = sat_feat.reshape(1, -1, A, A)
         kernel = g2s_feat * g2s_conf.pow(2)
@@ -514,18 +602,18 @@ class ModelWrapper(LightningModule):
         denominator = denominator_sat * denominator_grd
         denominator = torch.maximum(denominator, torch.ones_like(denominator) * 1e-6)
         corr = corr / denominator  # [B, H, W]
-        corr_H = int(20.0 * 3 / self.meters_per_pixel)
-        corr_W = int(20.0 * 3 / self.meters_per_pixel)
+        corr_H = int(20.0 * 3 / meter_per_pixel)
+        corr_W = int(20.0 * 3 / meter_per_pixel)
         corr = TF.center_crop(corr[:, None], [corr_H, corr_W])[:, 0]
 
         # compute pred_u and pred_v
         max_index = torch.argmax(corr.reshape(b, -1), dim=1)
 
-        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lon
-        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * self.meters_per_pixel  # / self.args.shift_range_lat
+        pred_u = (max_index % corr_W - corr_W / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lon
+        pred_v = (max_index // corr_W - corr_H / 2 + 0.5) * meter_per_pixel  # / self.args.shift_range_lat
 
-        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0
-        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0
+        gt_shift_u = batch['sat']['gt_shift_u'][:, 0] * 20.0 # 单位(m)
+        gt_shift_v = batch['sat']['gt_shift_v'][:, 0] * 20.0 # 单位(m)
         # Store pred_u and pred_v values in the lists
         self.pred_lons.extend(pred_u.cpu().detach().numpy())
         self.pred_lats.extend(pred_v.cpu().detach().numpy())
@@ -534,7 +622,7 @@ class ModelWrapper(LightningModule):
 
         # Visualize positions on satellite image
         self.visualize_positions_on_satellite(
-            corr, gaussians, batch
+            corr, gaussians, batch, meter_per_pixel
         )
 
     def visualize_positions_on_satellite(self, corr, gaussians, batch, meter_per_pixel):
@@ -665,12 +753,24 @@ class ModelWrapper(LightningModule):
         test_img = to_pil_image(rgb_input.clamp(min=0,max=1))
         test_img.save(os.path.join(save_dir, 'input2.png'))
 
-    def weakly_corr(self, sat_feat, g2s_feat, g2s_conf):
+    def weakly_corr(self, sat_feat, g2s_feat, g2s_conf, batch=None):
         # 这里实现弱监督相关性计算
         b = sat_feat.shape[0]
         # 检查输入是否包含 NaN 或 Inf
         if torch.isnan(sat_feat).any() or torch.isnan(g2s_feat).any() or torch.isnan(g2s_conf).any():
-            print("Warning: Input contains NaN values in supervise_corr")
+            print("Warning: Input contains NaN values in weakly_corr")
+
+            # 记录脏数据信息
+            additional_info = {
+                'sat_feat_nan_count': torch.isnan(sat_feat).sum().item(),
+                'g2s_feat_nan_count': torch.isnan(g2s_feat).sum().item(),
+                'g2s_conf_nan_count': torch.isnan(g2s_conf).sum().item(),
+                'dirty_line': batch['context']['line'],
+            }
+
+            # 记录脏数据信息
+            self.log_dirty_data(batch, "weakly_corr", additional_info)
+
             # 用 0 替换 NaN 值
             sat_feat = torch.nan_to_num(sat_feat, nan=0.0)
             g2s_feat = torch.nan_to_num(g2s_feat, nan=0.0)
@@ -694,7 +794,7 @@ class ModelWrapper(LightningModule):
         corr = 2 - 2 * corr / denominator  #[B, B, H, W]
         return corr
 
-    def supervise_corr(self, sat_feat, g2s_feat, g2s_conf):
+    def supervise_corr(self, sat_feat, g2s_feat, g2s_conf, batch=None):
         # 这里实现弱监督相关性计算
         B, c, crop_H, crop_W = g2s_feat.shape
         A = sat_feat.shape[-1]
@@ -702,10 +802,23 @@ class ModelWrapper(LightningModule):
         # 检查输入是否包含 NaN
         if torch.isnan(sat_feat).any() or torch.isnan(g2s_feat).any() or torch.isnan(g2s_conf).any():
             print("Warning: Input contains NaN values in supervise_corr")
+
+            # 记录脏数据信息
+            additional_info = {
+                'sat_feat_nan_count': torch.isnan(sat_feat).sum().item(),
+                'g2s_feat_nan_count': torch.isnan(g2s_feat).sum().item(),
+                'g2s_conf_nan_count': torch.isnan(g2s_conf).sum().item(),
+                'crop_size': f"{crop_H}x{crop_W}",
+                'dirty_line': batch['context']['line'],
+            }
+
+            # 记录脏数据信息
+            self.log_dirty_data(batch, "supervise_corr", additional_info)
             # 用 0 替换 NaN 值
             sat_feat = torch.nan_to_num(sat_feat, nan=0.0)
             g2s_feat = torch.nan_to_num(g2s_feat, nan=0.0)
             g2s_conf = torch.nan_to_num(g2s_conf, nan=0.0)
+            raise ValueError(f"NaN detected in supervise_corr. Check the above printed data path information.")
 
         # numerator
         signal = sat_feat.reshape(1, -1, A, A)    # [B, C, H, W]->[1, B*C, H, W]

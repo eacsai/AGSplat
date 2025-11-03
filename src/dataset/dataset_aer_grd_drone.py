@@ -38,6 +38,8 @@ class DatasetAerGrdDroneCfg(DatasetCfgCommon):
     sat_rot_align: bool = False
     GrdImg_H: int = 256
     GrdImg_W: int = 512
+    Rand_rot: int = 0  # 随机旋转范围，单位：度
+    Point: str = '500' # 加载点云的类型
 
 @dataclass
 class DatasetAerGrdDroneCfgWrapper:
@@ -90,16 +92,16 @@ class DatasetAerGrdDrone(IterableDataset):
         self.to_tensor = tf.ToTensor()        
         self.pro_grdimage_dir = 'depth_data'
         if self.stage in ("train"):
-            with open('/data/zhongyao/aer-grd-map/train_files_1027.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/train_files_1029.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
         else:
-            with open('/data/zhongyao/aer-grd-map/test_files_1027.txt', 'r') as f:
+            with open('/data/zhongyao/aer-grd-map/test_files_1029.txt', 'r') as f:
                 lines = f.readlines()
                 self.file_name = [l.rstrip() for l in lines][:int(len(lines) * data_amount)]
         self.final_h = cfg.GrdImg_H   # 1024
         self.final_w = cfg.GrdImg_W   # 1024
-        self.rotation_range = 0
+        self.rotation_range = cfg.Rand_rot
         self.padding_top = (self.final_w - cfg.GrdImg_H) // 2
         self.padding_left = (self.final_w - cfg.GrdImg_W) // 2
         self.grdimage_transform = transforms.Compose([
@@ -187,7 +189,7 @@ class DatasetAerGrdDrone(IterableDataset):
             grd_camera_name = grd_camera_path[-1].replace('.jpeg.jpg', '')
             drone_camera_path = drone_path.split('/')
             drone_camera_name = drone_camera_path[-1].replace('.jpeg.jpg', '')
-            camera_path = os.path.join('/', *grd_camera_path[0:5], 'grd_camera', f'{grd_camera_name}_{drone_camera_name}_grd_camera.pt')
+            camera_path = os.path.join('/', *grd_camera_path[0:5], 'grd_camera', f'{grd_camera_name}_{drone_camera_name}_grd_camera_{self.cfg.Point}.pt')
             grd_camera = torch.load(camera_path, map_location='cpu', weights_only=True)
 
             # 计算相机朝向(+Z轴方向)相对于世界坐标系Z轴方向(正东)的偏转角
@@ -200,7 +202,7 @@ class DatasetAerGrdDrone(IterableDataset):
             heading_degrees = np.degrees(heading)
 
             # 3. 处理卫星图
-            meter_per_pixel = 300 / min(sat_img.size)
+            meter_per_pixel = 500 / min(sat_img.size)
             # randomly generate shift
             # gt_shift_x负数的时候向右移动，正数的时候向左移动
             # gt_shift_y负数的时候向下移动，正数的时候向上移动
@@ -211,14 +213,15 @@ class DatasetAerGrdDrone(IterableDataset):
                 sat_aligh_cam = sat_img.rotate(heading_degrees)
             else:
                 sat_aligh_cam = sat_img
-            sat_rand_shift = sat_aligh_cam.transform(
-                sat_aligh_cam.size, Image.AFFINE,
+
+            # randomly generate roation
+            sat_rand_rot = \
+                sat_aligh_cam.rotate(theta * self.rotation_range)
+
+            sat_rand_shift_rand_rot = sat_rand_rot.transform(
+                sat_rand_rot.size, Image.AFFINE,
                 (1, 0, dx_p, 0, 1, -dy_p), resample=Image.BILINEAR
             )
-            
-            # randomly generate roation
-            sat_rand_shift_rand_rot = \
-                sat_rand_shift.rotate(theta * self.rotation_range)
 
             # central crop
             sat_rand_shift_rand_rot_central_crop_ref = TF.center_crop(sat_rand_shift_rand_rot, 210 / meter_per_pixel)
@@ -260,6 +263,7 @@ class DatasetAerGrdDrone(IterableDataset):
                     "grd_path": grd_path,
                     "drone_path": drone_path,
                     "grd_camera": grd_camera,
+                    "line": line
                 },
                 "target": {
                     "extrinsics": extrinsics[None],

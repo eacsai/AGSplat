@@ -1,21 +1,20 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
+
 import warnings
 import random
 import numpy as np
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
-
 # 设置 DDP 相关环境变量来优化性能
-os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 优化内存分配
+# os.environ["NCCL_DEBUG"] = "WARN"  # 减少 NCCL 调试信息
 
 # 设置确定性计算以获得可复现的结果
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # 确保CUDA运算确定性
 os.environ["PYTHONHASHSEED"] = "0"
 
 # 过滤 PyTorch 的警告
-warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
-warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match bucket view strides.*")
+# warnings.filterwarnings("ignore", category=UserWarning, message=".*TypedStorage is deprecated.*")
+# warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match bucket view strides.*")
 
 def fix_random_seed(seed: int = 42):
     """固定所有随机种子以确保可复现性"""
@@ -199,6 +198,22 @@ def train(cfg_dict: DictConfig):
     )
 
     if cfg.mode == "train":
+        # 如果检查点只包含权重，手动加载模型权重
+        if checkpoint_path is not None:
+            print(f"Loading weights from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+            if 'state_dict' in checkpoint:
+                # 处理Lightning检查点格式
+                state_dict = checkpoint['state_dict']
+                model_wrapper.load_state_dict(state_dict, strict=False)
+                print("Loaded model weights successfully (without optimizer state)")
+                checkpoint_path = None  # 设置为None，让trainer不尝试恢复训练状态
+            else:
+                # 直接的权重文件
+                model_wrapper.load_state_dict(checkpoint, strict=False)
+                print("Loaded model weights successfully (without optimizer state)")
+                checkpoint_path = None
+
         trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
     else:
         trainer.test(

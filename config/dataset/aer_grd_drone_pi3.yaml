@@ -14,5 +14,3 @@ max_fov: 100.0
 
 GrdImg_H: 256
 GrdImg_W: 512
-
-sat_rot_align: True

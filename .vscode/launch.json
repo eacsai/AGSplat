@@ -2,20 +2,6 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run re10k experiment",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/main.py",
-            "args": [
-                "+experiment=re10k",
-                "wandb.mode=disabled",
-                "wandb.name=re10k"
-            ],
-            "console": "integratedTerminal",
-            // --- 添加下面这一行 ---
-            "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
-        },
-        {
             "name": "Run aer_grd_drone experiment",
             "type": "debugpy",
             "request": "launch",
@@ -44,6 +30,22 @@
             "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
         },
         {
+            "name": "Run aer_grd_drone_pi3 Test",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": [
+                "+experiment=aer_grd_drone_pi3_test",
+                "mode=test",
+                "wandb.mode=disabled",
+                "checkpointing.load=./outputs/train/exp_aer_grd_drone_pi3_rot20/checkpoints/epoch_01-test.ckpt",
+                "wandb.name=aer_grd_drone_pi3_rot20"
+            ],
+            "console": "integratedTerminal",
+            // --- 添加下面这一行 ---
+            "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
+        },
+        {
             "name": "Run kitti experiment",
             "type": "debugpy",
             "request": "launch",
@@ -56,23 +58,6 @@
             "console": "integratedTerminal",
             // --- 添加下面这一行 ---
             "cwd": "${workspaceFolder}" // <-- 仍然必须保留这一行！
-        },
-        {
-            "name": "Run re10k test",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${file}",
-            "args": [
-                "+experiment=re10k",
-                "mode=test",
-                "dataset/view_sampler@dataset.re10k.view_sampler=evaluation",
-                "dataset.re10k.view_sampler.index_path=assets/evaluation_index_re10k.json",
-                "checkpointing.load=./pretrained_weights/mixRe10kDl3dv.ckpt",
-                "test.save_image=true",
-                "wandb.name=acid",
-                // "wandb.mode=disabled"
-            ],
-            "console": "integratedTerminal"
         },
         {
             "name": "Run kitti test",

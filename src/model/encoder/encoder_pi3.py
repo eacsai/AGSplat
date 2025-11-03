@@ -51,7 +51,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         self.backbone = BackboneDino()
         self.backbone_projection = nn.Sequential(
             nn.ReLU(),
-            nn.Linear(self.backbone.d_out, 128),
+            nn.Linear(self.backbone.d_out + 3 + 3, 128),
         )
         self.to_gaussians = nn.Sequential(
             nn.ReLU(),
@@ -82,12 +82,20 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
     ) -> Gaussians:
         image = batch["context"]["image"]
         b, v, _, h, w = image.shape
-
+        pts_feat = rearrange(
+            batch["context"]['grd_camera']['pts_gd'],
+            "b 1 (v h w) xyz -> b v h w xyz",
+            v=v, h=h, w=w,
+        )
+        img_feat = rearrange(
+            image,
+            "b v c h w -> b v h w c",
+        )
         with torch.cuda.amp.autocast(enabled=False):
             features = self.backbone(image)
             h, w = features.shape[-2:]
             features = rearrange(features, "b v c h w -> b v h w c").contiguous()
-            features = self.backbone_projection(features)
+            features = self.backbone_projection(torch.cat((features, pts_feat, img_feat), dim=-1))
             features = rearrange(features, "b v h w c -> b v c h w").contiguous()
 
             if self.high_resolution_skip is not None:

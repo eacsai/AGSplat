@@ -19,9 +19,9 @@ model:
 
 dataset:
   aer_grd_drone_pi3:
-    sat_rot_align: True
-    Rand_rot: 20  # 增加随机旋转范围以增强数据多样性
-    Point: '500'
+    sat_rot_align: false
+    Rand_rot: 0  # 增加随机旋转范围以增强数据多样性
+    Point: 'vggt_rot'
     view_sampler:
       warm_up_steps: 9375
 
@@ -35,9 +35,9 @@ data_loader:
     batch_size: 16
 
 trainer:
-  max_epochs: 4
+  max_epochs: 10
   val_check_interval: 1.0
-  max_steps: 9000 # 确保训练不会因为步数限制而过早停止
+  max_steps: 28000 # 确保训练不会因为步数限制而过早停止
 
 # 指定要加载的预训练权重路径
 # checkpointing:

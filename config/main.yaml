@@ -17,14 +17,14 @@ mode: train
 data_loader:
   # Avoid having to spin up new processes to print out visualizations.
   train:
-    num_workers: 32
+    num_workers: 72
     persistent_workers: true
     batch_size: 2
     seed: 7788
   test:
-    num_workers: 1
+    num_workers: 8
     persistent_workers: false
-    batch_size: 8
+    batch_size: 16
     seed: 2345
   val:
     num_workers: 1
@@ -63,16 +63,16 @@ test:
   save_video: false
   save_compare: false
 
-seed: 111
+seed: 8842
 
 trainer:
-  max_steps: 25000
-  gradient_clip_val: 0.5
+  max_steps: 10000
+  gradient_clip_val: 10.0
   num_nodes: 1
   check_val_every_n_epoch: 1
-  max_epochs: 10
+  max_epochs: 4
   enable_progress_bar: true
-  num_sanity_val_steps: 0
+  num_sanity_val_steps: 2
 
 hydra:
   run:
