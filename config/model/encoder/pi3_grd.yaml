@@ -1,0 +1,4 @@
+name: pi3_grd
+gaussians_per_pixel: 1
+pose_free: true
+pretrained_weights: ""

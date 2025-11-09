@@ -21,7 +21,7 @@ dataset:
   aer_grd_drone_pi3:
     sat_rot_align: false
     Rand_rot: 0  # 增加随机旋转范围以增强数据多样性
-    Point: '500_rot'
+    Point: 'mega_rot'
     view_sampler:
       warm_up_steps: 9375
 

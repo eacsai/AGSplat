@@ -33,16 +33,16 @@ class OpacityMappingCfg:
 
 
 @dataclass
-class EncoderPi3Cfg:
-    name: Literal["pi3"]
+class EncoderPi3GrdCfg:
+    name: Literal["pi3_grd"]
     gaussians_per_pixel: int
     pose_free: bool = True
     pretrained_weights: str = ""
 
 
-class EncoderPi3(Encoder[EncoderPi3Cfg]):
+class EncoderPi3Grd(Encoder[EncoderPi3GrdCfg]):
 
-    def __init__(self, cfg: EncoderPi3Cfg) -> None:
+    def __init__(self, cfg: EncoderPi3GrdCfg) -> None:
         super().__init__(cfg)
 
         self.pose_free = cfg.pose_free
@@ -80,10 +80,10 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
     ) -> Gaussians:
-        image = batch["context"]["image"]
+        image = batch["context"]["image"][:,:1]
         b, v, _, h, w = image.shape
         pts_feat = rearrange(
-            batch["context"]['grd_camera']['pts_gd'],
+            batch["context"]['grd_camera']['pts_gd'][:,:, :128*128],
             "b 1 (v h w) xyz -> b v h w xyz",
             v=v, h=h, w=w,
         )
@@ -100,7 +100,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
 
             if self.high_resolution_skip is not None:
                 # Add the high-resolution skip connection.
-                skip = rearrange(batch["context"]["image"], "b v c h w -> (b v) c h w")
+                skip = rearrange(batch["context"]["image"][:,:1], "b v c h w -> (b v) c h w")
                 skip = self.high_resolution_skip(skip)
                 features = features + rearrange(skip, "(b v) c h w -> b v c h w", b=b, v=v)
 
@@ -108,16 +108,14 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
             gaussians = self.to_gaussians(features)
             gaussians = gaussians.view(b, v, h * w, self.gpv, -1)  # [b v (h w) gpv _]
 
-        mask = F.interpolate(batch["context"]['mask'][:, 1:], size=feat_size, mode='nearest')
+        mask = F.interpolate(batch["context"]['mask'][:, :1], size=feat_size, mode='nearest')
         mask = rearrange(mask, 'b v h w -> b v (h w)')[..., None, None] # [b v (h w) 1 1]
 
         rgb1 = batch["context"]["image"][:,0]
         rgb1 = F.interpolate(rgb1, size=feat_size, mode='bilinear', align_corners=False)
         rgb1 = rearrange(rgb1, "b c h w -> b (h w) 1 c")
-        rgb2 = batch["context"]["image"][:,1]
-        rgb2 = F.interpolate(rgb2, size=feat_size, mode='bilinear', align_corners=False)
-        rgb2 = rearrange(rgb2, "b c h w -> b (h w) 1 c")
-        rgb_all = torch.stack((rgb1, rgb2), dim=1) # [b v (h w) 1 c]
+
+        rgb_all = rgb1.unsqueeze(1)
         rgb_all = rgb_all * mask
         rgb_all  = rgb_all.repeat(1, 1, 1, self.gpv, 1)  # [b v (h w) gpv c]
 
@@ -144,7 +142,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
             scales = scales.clamp_max(0.1)
         
         pts_all = rearrange(
-            batch["context"]['grd_camera']['pts_gd'],
+            batch["context"]['grd_camera']['pts_gd'][:, :, :128*128],
             "b 1 n xyz -> b n 1 xyz",
         ).detach()
         offset_xyz = rearrange(

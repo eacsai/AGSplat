@@ -15,7 +15,7 @@ from ..model.decoder.decoder import DecoderOutput
 from ..model.types import Gaussians
 from .loss import Loss
 
-grid_size = 164.0  # meter
+grid_size = 210.0  # meter
 down_sample = 4
 def create_metric_grid(grid_size, res, batch_size, only_front=False):
     if only_front: 
@@ -197,8 +197,8 @@ class LossGlue(Loss[LossGlueCfg, LossGlueCfgWrapper]):
     ) -> Float[Tensor, ""]:
         # Scale the depth between the near and far planes.
 
-        grd_desc = grd_feat.flatten(2)  # [B, C, H, W] -> [B, C, H*W]
-        sat_desc = sat_feat.flatten(2)  # [B, C, H, W] -> [B, C, H*W]
+        grd_desc = F.interpolate(grd_feat, scale_factor=0.5, mode='bilinear', align_corners=False).flatten(2)  # [B, C, H, W] -> [B, C, H*W]
+        sat_desc = F.interpolate(sat_feat, scale_factor=0.5, mode='bilinear', align_corners=False).flatten(2)  # [B, C, H, W] -> [B, C, H*W]
 
         matching_score_original = torch.matmul(sat_desc.transpose(1, 2), grd_desc) / self.cfg.temperature  # [B, H*W, H*W]
         matching_score_original[matching_score_original == 0] = float('-inf')
@@ -222,8 +222,8 @@ class LossGlue(Loss[LossGlueCfg, LossGlueCfgWrapper]):
         sampled_idx_sat = torch.div(sampled_idx, num_kpts_grd, rounding_mode='trunc')
         sampled_idx_grd = (sampled_idx % num_kpts_grd)
 
-        sat_metric_coord = create_metric_grid(grid_size, sat_feat.shape[-1], bs).to(sat_feat.device)
-        grd_metric_coord = create_metric_grid(grid_size, grd_feat.shape[-1], bs).to(sat_feat.device)
+        sat_metric_coord = create_metric_grid(grid_size, sat_feat.shape[-1] // 2, bs).to(sat_feat.device)
+        grd_metric_coord = create_metric_grid(grid_size, grd_feat.shape[-1] // 2, bs).to(sat_feat.device)
         
         X = sat_metric_coord[batch_idx, sampled_idx_sat, :]
         Y = grd_metric_coord[batch_idx, sampled_idx_grd, :]
@@ -235,7 +235,7 @@ class LossGlue(Loss[LossGlueCfg, LossGlueCfgWrapper]):
             print('t is None')
             return torch.tensor(1.0, device=sat_feat.device)
 
-        loss_vce = compute_vce_loss(metric_coord4loss.to(sat_feat.device), batch["sat"]["gt_r"], batch['sat']["gt_loc"] / down_sample, R, t)
+        loss_vce = compute_vce_loss(metric_coord4loss.to(sat_feat.device), batch["sat"]["gt_r"], batch['sat']["gt_loc"], R, t)
         avg_loss = loss_vce.mean()
 
         # 可视化第一章卫星图像上相机位置
@@ -248,23 +248,23 @@ class LossGlue(Loss[LossGlueCfg, LossGlueCfgWrapper]):
         pred_v = -t[:,0,0] * meter_per_pixel * down_sample
 
         # 添加可视化功能
-        if self.cfg.enable_visualization:
-            # 获取卫星图像（假设batch中有sat_img或可以从sat_feat转换）
-            sat_img = batch['sat']['sat'][0]  # 取第一个样本的卫星图像
+        # if self.cfg.enable_visualization:
+        #     # 获取卫星图像（假设batch中有sat_img或可以从sat_feat转换）
+        #     sat_img = batch['sat']['sat_ref'][0]  # 取第一个样本的卫星图像
 
-            # 使用初始化时设置的meter_per_pixel值
+        #     # 使用初始化时设置的meter_per_pixel值
 
-            # 准备相机位置列表
-            camera_positions = []
-            camera_positions.append([gt_delta_x[0].item(), gt_delta_y[0].item()])
-            camera_positions.append([pred_u[0].item(), pred_v[0].item()])
-            # 调用可视化函数
-            self.visualize_camera_position_on_satellite(
-                sat_img=sat_img,
-                gt_positions=camera_positions,
-                meter_per_pixel=meter_per_pixel,
-                save_path="./camera_position_visualization",
-                img_name="camera_pos"
-            )
+        #     # 准备相机位置列表
+        #     camera_positions = []
+        #     camera_positions.append([gt_delta_x[0].item(), gt_delta_y[0].item()])
+        #     camera_positions.append([pred_u[0].item(), pred_v[0].item()])
+        #     # 调用可视化函数
+        #     self.visualize_camera_position_on_satellite(
+        #         sat_img=sat_img,
+        #         gt_positions=camera_positions,
+        #         meter_per_pixel=meter_per_pixel,
+        #         save_path="./camera_position_visualization",
+        #         img_name="camera_pos"
+        #     )
 
         return avg_loss

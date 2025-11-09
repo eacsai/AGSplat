@@ -2,7 +2,7 @@
 
 defaults:
   - /dataset@_group_.aer_grd_drone_pi3: aer_grd_drone_pi3
-  - override /loss: [glue]
+  - override /loss: [bev]
 
 wandb:
   name: aer_grd_drone_pi3
@@ -10,7 +10,7 @@ wandb:
 
 model:
   encoder:
-    name: pi3
+    name: pi3_grd
     gaussians_per_pixel: 1
     pose_free: true
 
@@ -21,8 +21,7 @@ dataset:
   aer_grd_drone_pi3:
     sat_rot_align: True
     Rand_rot: 20  # 增加随机旋转范围以增强数据多样性
-    input_image_shape: [128, 128]
-    Point: 'vggt'
+    Point: '500'
     view_sampler:
       warm_up_steps: 9375
 
@@ -47,3 +46,4 @@ trainer:
 train:
   weakly_supervised: false
   meter_per_pixel: 0.41015625
+  pts_type: 'grd'

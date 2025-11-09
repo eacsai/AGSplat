@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # 指定使用的GPU设备ID
 
 import warnings
 import random

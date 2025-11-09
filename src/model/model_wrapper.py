@@ -91,6 +91,7 @@ class TrainCfg:
     distill_max_steps: int
     meter_per_pixel: float
     weakly_supervised: bool
+    pts_type: str = 'all'  # 'grd', 'drone', 'all'
 
 
 @runtime_checkable
@@ -321,19 +322,21 @@ class ModelWrapper(LightningModule):
         # Compute and log loss.
         total_loss = 0
         for loss_fn in self.losses:
-            # loss = loss_fn.forward(
-            #     batch,
-            #     sat_feat,
-            #     g2s_feat,
-            #     self.meter_per_pixel,
-            #     weakly_supervised=self.train_cfg.weakly_supervised,
-            # )
-            loss = loss_fn.forward(
-                batch,
-                corr,
-                meter_per_pixel,
-                weakly_supervised=self.train_cfg.weakly_supervised,
-            )
+            if loss_fn.name == 'glue':
+                loss = loss_fn.forward(
+                    batch,
+                    sat_feat,
+                    g2s_feat,
+                    self.meter_per_pixel,
+                    weakly_supervised=self.train_cfg.weakly_supervised,
+                )
+            else:
+                loss = loss_fn.forward(
+                    batch,
+                    corr,
+                    meter_per_pixel,
+                    weakly_supervised=self.train_cfg.weakly_supervised,
+                )
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
 
@@ -375,9 +378,16 @@ class ModelWrapper(LightningModule):
         batch: BatchedExample = self.data_shim(batch)
 
         b, v, _, h, w = batch["target"]["image"].shape
+        if self.train_cfg.pts_type == 'grd':
+            feat_img = batch["context"]["feat_image"][:, :1]
+            grd_img = batch["context"]["image"][:, :1]
+        elif self.train_cfg.pts_type == 'drone':
+            feat_img = batch["context"]["feat_image"][:, 1:]
+            grd_img = batch["context"]["image"][:, 1:]
+        else:
+            feat_img = batch["context"]["feat_image"]
+            grd_img = batch["context"]["image"]
 
-        feat_img = batch["context"]["feat_image"]
-        grd_img = batch["context"]["image"]
         b, v, _, h, w = grd_img.shape
         feat_img = rearrange(feat_img, "b v c h w -> (b v) c h w")
         sat_img = batch["sat"]["sat_ref"]
@@ -417,7 +427,7 @@ class ModelWrapper(LightningModule):
             # extrinsics = grd_camera.extrinsics
             # output = self.decoder.forward(
             #     gaussians,
-            #     extrinsics,
+            #     batch["target"]["extrinsics"],
             #     intrinsics,
             #     batch["target"]["near"],
             #     batch["target"]["far"],

@@ -39,8 +39,8 @@ class OpacityMappingCfg:
 
 
 @dataclass
-class EncoderPi3Cfg:
-    name: Literal["pi3"]
+class EncoderPi3PredCfg:
+    name: Literal["pi3_pred"]
     gaussians_per_pixel: int
     pose_free: bool = True
     pretrained_weights: str = ""
@@ -96,9 +96,9 @@ def world_to_camera_broadcast(pts_all, extrinsics_c2w):
     return pts_cam
 
 
-class EncoderPi3(Encoder[EncoderPi3Cfg]):
+class EncoderPi3Pred(Encoder[EncoderPi3PredCfg]):
 
-    def __init__(self, cfg: EncoderPi3Cfg) -> None:
+    def __init__(self, cfg: EncoderPi3PredCfg) -> None:
         super().__init__(cfg)
 
         self.backbone = Pi3.from_pretrained("yyfz233/Pi3")
@@ -123,7 +123,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         self.rot_act = lambda x: F.normalize(x, dim=-1)
 
         self.offset_max = [0.01] * 3
-        self.scale_max = [0.01] * 3
+        self.scale_max = [0.001] * 3
 
         self.meter_per_pixel = 140 / 128
         print("Freezing backbone Pi3 weights.")
@@ -141,9 +141,8 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         context = batch["context"]
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
-        mask = F.interpolate(context['mask'], size=feat_size, mode='nearest')
-        mask = rearrange(mask, 'b v h w -> b v (h w)')[..., None, None] # [b v (h w) 1 1]
-
+        mask_pts = context['mask'].unsqueeze(-1) # [b, v, H, W, 1]
+        mask_res = F.interpolate(context['mask'][:, 1:], size=feat_size, mode='bilinear', align_corners=False)
         sat_img = batch['sat']['sat_pi3'].unsqueeze(1)  # [b, 3, H, W]
         # 使用 torch.no_grad() 上下文管理器
         with torch.no_grad():
@@ -151,23 +150,37 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
             # Encode the context images.
             results = self.backbone(torch.cat((sat_img, context["image"]), dim=1))
         
-            pts_all = results['points'][:, 1:] # [b, v, h, w, 3]
+            pts_all = results['points'] # [b, v, h, w, 3]
+            conf_all = torch.sigmoid(results['conf'])  # [b, v, h, w, 1]
+
+            # Reconstruct point cloud in reference camera coordinate system
+            reference_cam = results['camera_poses'][:, 0]  # [b, 4, 4]
+            camera_poses = torch.einsum('bij, bvjk -> bvik', se3_inverse(reference_cam), results['camera_poses'])  # [b, v, 4, 4]
+            pts_all = torch.einsum('bij, bvhwj -> bvhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]  # [b, v, h, w, 3]
+            
+            conf_flat = conf_all.view(conf_all.shape[0], -1)  # (B, N)
+            conf_threshold = torch.quantile(conf_flat, 0.2, dim=1, keepdim=True)  # Find 20th percentile for each batch
+            conf_mask = conf_all >= conf_threshold.view(-1, 1, 1, 1, 1)  # (B, V, H, W, 1)
+
+            pts_all = pts_all * conf_mask.float() * mask_pts.float()
+            dis_all = torch.norm(pts_all, dim=-1).reshape(b, -1)  # (B, N)
+            norm_factor = dis_all.sum(dim=[-1]) / ((conf_mask.float() * mask_pts.float()).reshape(b, -1).sum(dim=[-1]) + 1e-5) # [B]
+
+            pts_all = pts_all / (norm_factor.view(b, 1, 1, 1, 1) + 1e-5)
+            camera_poses[:, :, :3, 3] = camera_poses[:, :, :3, 3] / (norm_factor.view(b, 1, 1) + 1e-5)
+            pts_sat = pts_all[:, 0]  # [b, H, W, 3]
+
             pts_all = F.interpolate(
                 rearrange(pts_all, "b v h w c -> (b v) c h w"),
                 size=feat_size,
                 mode='bilinear',
                 align_corners=False,
             )
-            pts_all = rearrange(pts_all, "(b v) c h w -> b v h w c", b=b, v=v)  # [b, v, h', w', 3]
+            pts_all = rearrange(pts_all, "(b v) c h w -> b v h w c", b=b, v=v+1)  # [b, v, h', w', 3]
+            pts_all = pts_all[:, 1:]  # 去掉卫星视角点云 [b, v, h', w', 3]
 
             hidden = results['hidden'][b:]  # [(b v), n, d]
             pos = results['pos'][b:]  # [(b v), n, d]
-
-            # Reconstruct point cloud in reference camera coordinate system
-            reference_cam = results['camera_poses'][:, 0]  # [b, 4, 4]
-            camera_poses = torch.einsum('bij, bvjk -> bvik', se3_inverse(reference_cam), results['camera_poses'])  # [b, v, 4, 4]
-            pts_all = torch.einsum('bij, bvhwj -> bvhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]  # [b, v, h, w, 3]
-            pts_sat = torch.einsum('bij, bhwj -> bhwi', se3_inverse(reference_cam), homogenize_points(results['points'][:, 0]))[..., :3]  # [b, H, W, 3]
 
         with torch.cuda.amp.autocast(enabled=False):
             # for the 3DGS heads
@@ -194,7 +207,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         rgb2 = F.interpolate(rgb2, size=feat_size, mode='bilinear', align_corners=False)
         rgb2 = rearrange(rgb2, "b c h w -> b (h w) 1 c")
         rgb_all = torch.stack((rgb1, rgb2), dim=1) # [b v (h w) 1 c]
-        rgb_all = rgb_all * mask
+
         rgb_all  = rgb_all.repeat(1, 1, 1, self.gpv, 1)  # [b v (h w) gpv c]
         depths = pts_all[..., -1].unsqueeze(-1) # [b v (h w) 1 1]
 
@@ -209,7 +222,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
             gs_offsets_z = self.pos_act(gaussians[..., 2:3]) * self.offset_max[1]
             offset_xyz = torch.cat([gs_offsets_x, gs_offsets_y, gs_offsets_z], dim=-1) # [b v (h w) gpv 3]
 
-            opacities = self.opacity_act(gaussians[..., 3:4]).squeeze(-1)
+            opacities = self.opacity_act(gaussians[..., 3:4]).squeeze(-1).clamp_min(0.5)
             rotations = self.rot_act(gaussians[..., 4:8])
 
             scale_x = self.scale_act(gaussians[..., 8:9]) * self.scale_max[0]
@@ -224,7 +237,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         covariances = build_covariance(scales, rotations) # [b v (h w) gpv 3 3]
 
         # Recover intrinsics from local points
-        points = results["local_points"][:, 0]
+        points = pts_sat
         masks = torch.sigmoid(results["conf"][:, 0, :, :, 0]) > 0.1
         points = points * masks.float().unsqueeze(-1)
         width = torch.amax(points[..., 0], dim=(1,2)) - torch.amin(points[..., 0], dim=(1,2))
@@ -285,7 +298,7 @@ class EncoderPi3(Encoder[EncoderPi3Cfg]):
         extrinsics[:, 3, 3] = 1.0  # 齐次坐标
 
         pts_all = world_to_camera_broadcast(pts_all, extrinsics)
-        pts_all = pts_all * mask # [b v (h w) gpv 3]
+        pts_all = pts_all * rearrange(mask_res, 'b v h w -> b v (h w)')[..., None, None] # [b v (h w) gpv 3]
 
         return Gaussians(
             pts_all.reshape(b, -1, 3),

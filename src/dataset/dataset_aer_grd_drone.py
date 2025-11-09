@@ -254,7 +254,7 @@ class DatasetAerGrdDrone(IterableDataset):
                     "extrinsics": torch.stack((cam2world, cam2world), dim=0),
                     "intrinsics": torch.stack((left_camera_k, left_camera_k), dim=0),
                     "image": torch.cat((grd_img_pi3, drone_img_pi3), dim=0),
-                    "mask": torch.cat((grd_mask_pi3, drone_mask_pi3), dim=0),
+                    "mask": torch.cat((torch.ones_like(grd_mask_pi3, dtype=grd_mask_pi3.dtype), grd_mask_pi3, drone_mask_pi3), dim=0),
                     "feat_image": torch.cat((grd_left_feat, grd_left_feat), dim=0),
                     "near": self.get_bound("near", 1),
                     "far": self.get_bound("far", 1),
@@ -281,7 +281,7 @@ class DatasetAerGrdDrone(IterableDataset):
                     "gt_shift_u": torch.tensor([-gt_shift_x], dtype=torch.float32),
                     "gt_shift_v": torch.tensor([gt_shift_y], dtype=torch.float32),
                     "gt_heading": torch.tensor([heading], dtype=torch.float32),
-                    "gt_loc": torch.tensor([[-dy_p, dx_p]], dtype=torch.float32),
+                    "gt_loc": torch.tensor([[-gt_shift_y * self.shift_range_meters_lat, gt_shift_x * self.shift_range_meters_lon]], dtype=torch.float32),
                     "gt_r": torch.zeros((2,2), dtype=torch.float32)
                 },
                 "scene": 'kitti',
